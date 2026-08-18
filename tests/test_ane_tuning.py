@@ -156,6 +156,32 @@ def test_ane_execution_is_unknown_without_the_profiler():
     )
 
 
+def test_prefill_step_size_respects_the_qwen35_floor():
+    """The floor raises the requested chunk above the configured step.
+
+    Scheduler._prefill_chunk_size() takes max(config, floor), so reading the
+    config alone would name the wrong sequence_length on a >= 64 GB machine
+    serving a qwen3_5 model, where the floor is 4096.
+    """
+    engine = SimpleNamespace(
+        _scheduler_config=SimpleNamespace(prefill_step_size=2048),
+        _engine=SimpleNamespace(
+            engine=SimpleNamespace(
+                scheduler=SimpleNamespace(_qwen35_prefill_floor=4096)
+            )
+        ),
+    )
+    assert ane_tuning._prefill_step_size(engine) == 4096
+
+    no_floor = SimpleNamespace(
+        _scheduler_config=SimpleNamespace(prefill_step_size=2048),
+        _engine=SimpleNamespace(
+            engine=SimpleNamespace(scheduler=SimpleNamespace(_qwen35_prefill_floor=0))
+        ),
+    )
+    assert ane_tuning._prefill_step_size(no_floor) == 2048
+
+
 def test_prefill_step_size_reads_scheduler_config():
     engine = SimpleNamespace(_scheduler_config=SimpleNamespace(prefill_step_size=4096))
     assert ane_tuning._prefill_step_size(engine) == 4096
