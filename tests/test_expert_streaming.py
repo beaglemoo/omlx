@@ -385,6 +385,59 @@ def test_cache_only_install_requires_no_manifest(tmp_path):
     assert type(model).__call__ is original_call
 
 
+def test_native_demand_patches_synchronize_until_last_runtime_closes(tmp_path):
+    from omlx.custom_kernels.fast_resource_loading import available
+
+    if not available():
+        pytest.skip("Fast Resource Loading extension unavailable")
+    original = mx.synchronize
+    _checkpoint(tmp_path)
+    kwargs = dict(
+        cache_experts=2,
+        streaming_mode="cache_only",
+        fast_resource_loading=True,
+        direct_io=True,
+        native_demand=True,
+    )
+    first = install_expert_streaming(_streamable_test_model(), tmp_path, None, **kwargs)
+    try:
+        assert mx.synchronize is not original
+        assert mx.synchronize.__wrapped__ is original
+        second = install_expert_streaming(
+            _streamable_test_model(), tmp_path, None, **kwargs
+        )
+        try:
+            # The GIL-releasing variant must still be a working barrier.
+            value = mx.random.normal((64, 64)) @ mx.random.normal((64, 64))
+            mx.async_eval(value)
+            mx.synchronize()
+            mx.synchronize(mx.default_stream(mx.default_device()))
+            mx.synchronize(mx.default_device())
+            mx.synchronize(mx.new_thread_local_stream(mx.default_device()))
+            with pytest.raises(TypeError):
+                mx.synchronize("not a stream")
+            assert value.shape == (64, 64)
+        finally:
+            second.close()
+        assert mx.synchronize is not original
+    finally:
+        first.close()
+    assert mx.synchronize is original
+
+    # Without native demand the module is left untouched.
+    plain = install_expert_streaming(
+        _streamable_test_model(),
+        tmp_path,
+        None,
+        cache_experts=2,
+        streaming_mode="cache_only",
+    )
+    try:
+        assert mx.synchronize is original
+    finally:
+        plain.close()
+
+
 def test_fast_resource_loading_writes_exact_preallocated_bank_rows(tmp_path):
     from omlx.custom_kernels.fast_resource_loading import available
 

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -323,6 +324,40 @@ static void eval_with_gil_released(const nb::args& values) {
   // GIL so the exact-demand callback can publish the missing rows.
   nb::gil_scoped_release release;
   mx::eval(std::move(arrays));
+}
+
+static void synchronize_with_gil_released(nb::object stream) {
+  // mx.synchronize() holds the GIL while it blocks in waitUntilCompleted.
+  // If the pending command buffer carries an exact-demand miss, its Metal
+  // completion handler needs the GIL to publish the missing rows, and the
+  // process deadlocks.  Resolve the stream while the GIL is held, then wait
+  // without it.  See eval_with_gil_released for the eval() counterpart.
+  // Accept everything mx.synchronize() accepts: a Stream, a
+  // ThreadLocalStream (mlx-lm/mlx-vlm generation streams), a Device, or None.
+  std::optional<mx::Stream> target;
+  std::optional<mx::ThreadLocalStream> thread_local_target;
+  if (nb::isinstance<mx::ThreadLocalStream>(stream)) {
+    thread_local_target = nb::cast<mx::ThreadLocalStream>(stream);
+  } else if (nb::isinstance<mx::Stream>(stream)) {
+    target = nb::cast<mx::Stream>(stream);
+  } else if (nb::isinstance<mx::Device>(stream)) {
+    target = mx::default_stream(nb::cast<mx::Device>(stream));
+  } else if (nb::isinstance<mx::Device::DeviceType>(stream)) {
+    target = mx::default_stream(
+        mx::Device(nb::cast<mx::Device::DeviceType>(stream)));
+  } else if (!stream.is_none()) {
+    throw nb::type_error(
+        "synchronize_with_gil_released expects a Stream, ThreadLocalStream, "
+        "Device, or None");
+  }
+  nb::gil_scoped_release release;
+  if (thread_local_target) {
+    mx::synchronize(*thread_local_target);
+  } else if (target) {
+    mx::synchronize(*target);
+  } else {
+    mx::synchronize();
+  }
 }
 
 struct LoadTicket {
@@ -785,6 +820,10 @@ NB_MODULE(_ext, m) {
       "callback"_a);
   m.def("check_async_route_error", &check_async_route_error);
   m.def("eval_with_gil_released", &eval_with_gil_released);
+  m.def(
+      "synchronize_with_gil_released",
+      &synchronize_with_gil_released,
+      nb::arg("stream").none() = nb::none());
   nb::class_<LoadTicket>(m, "LoadTicket")
       .def_prop_ro("bytes", [](const LoadTicket& ticket) { return ticket.bytes; })
       .def_prop_ro("commands", [](const LoadTicket& ticket) { return ticket.commands; });

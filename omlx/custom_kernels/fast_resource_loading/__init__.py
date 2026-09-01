@@ -9,6 +9,7 @@ try:
         check_async_route_error,
         eval_with_gil_released,
         resolve_route_async,
+        synchronize_with_gil_released,
     )
 
     _IMPORT_ERROR: Exception | None = None
@@ -18,6 +19,7 @@ except Exception as exc:  # pragma: no cover - depends on optional native build
     check_async_route_error = None  # type: ignore[assignment]
     eval_with_gil_released = None  # type: ignore[assignment]
     resolve_route_async = None  # type: ignore[assignment]
+    synchronize_with_gil_released = None  # type: ignore[assignment]
     _IMPORT_ERROR = exc
 
 
@@ -45,4 +47,5 @@ __all__ = [
     "eval_with_gil_released",
     "import_error",
     "resolve_route_async",
+    "synchronize_with_gil_released",
 ]
