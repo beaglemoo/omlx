@@ -146,3 +146,18 @@ class ExpertStreamingExecution:
             finally:
                 self._set_mode("checked")
                 self._executing = False
+                if not is_decode:
+                    # A streamed prefill chunk allocates short-lived gather
+                    # and scratch buffers in many distinct shapes, and the
+                    # MLX pool retains all of them: a 2048-token chunk on
+                    # Qwen3.8 Flash Next grew the pool by ~13 GB while live
+                    # Metal memory rose 3 GB. The scheduler's prefill guard
+                    # prices that footprint delta as the next chunk's
+                    # transient and refuses long prompts that would fit.
+                    # Return the pool at the prefill boundary; decode passes
+                    # keep their warm buffers. Metal defers the release of
+                    # buffers still referenced by in-flight command buffers,
+                    # so drain the stream first or the footprint the guard
+                    # samples right after this call still carries the pool.
+                    mx.synchronize()
+                    mx.clear_cache()
