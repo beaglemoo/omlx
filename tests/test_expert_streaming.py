@@ -239,6 +239,47 @@ def test_cache_only_residency_requires_no_manifest(tmp_path):
     assert estimate.cache_slots_per_layer == 2
 
 
+def test_qwen4_exp_residency_excludes_forced_mmap_ple(tmp_path):
+    _checkpoint(tmp_path)
+    ple = {
+        "language_model.model.layers.0.ple.ngram_embedding.weight": mx.zeros(
+            (4096, 64), dtype=mx.float16
+        )
+    }
+    ple_shard = "model-00002-of-00002.safetensors"
+    mx.save_safetensors(str(tmp_path / ple_shard), ple, metadata={"format": "mlx"})
+    index_path = tmp_path / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"].update({key: ple_shard for key in ple})
+    index_path.write_text(json.dumps(index))
+    ple_bytes = 4096 * 64 * 2
+
+    def estimate(model_type):
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+        return estimate_expert_streaming_residency(
+            tmp_path,
+            None,
+            cache_experts=2,
+            scratch_experts=0,
+            num_layers=1,
+            num_experts=6,
+            top_k=2,
+            streaming_mode="cache_only",
+        )
+
+    plain = estimate("qwen3_5_moe")
+    qwen4 = estimate("qwen4_exp")
+
+    # Streaming forces the Qwen4-Exp PLE onto mmap, so it must not be charged
+    # as resident; any other architecture keeps the full fixed trunk.
+    assert plain.mmap_bytes == 0
+    assert qwen4.mmap_bytes == ple_bytes
+    assert plain.fixed_bytes - qwen4.fixed_bytes == ple_bytes
+    assert plain.resident_bytes - qwen4.resident_bytes == pytest.approx(
+        ple_bytes * 1.05, abs=1
+    )
+
+
 def test_cold_reader_coalesces_small_gaps_without_affecting_direct_preload(tmp_path):
     _checkpoint(tmp_path)
     index = SafetensorExpertIndex(tmp_path)

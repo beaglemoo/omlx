@@ -18,11 +18,37 @@ class ExpertStreamingEstimate:
     checkpoint_bytes: int
     streamed_tensor_bytes: int
     fixed_bytes: int
+    # Non-expert tensors that stay on their mmap/SSD path while streaming is
+    # enabled (currently the Qwen4-Exp PLE), excluded from ``fixed_bytes``.
+    mmap_bytes: int
     pinned_bytes: int
     cache_bytes: int
     scratch_bytes: int
     resident_bytes: int
     cache_slots_per_layer: int
+
+
+def _forced_mmap_bytes(model_path: Path) -> int:
+    """Bytes the loader keeps on an mmap path whenever streaming is enabled.
+
+    ``maybe_apply_pre_load_patches`` forces the Qwen4-Exp PLE onto its mmap/SSD
+    path for every expert-streaming load, so those tensors never become
+    resident and must not be charged against the admission ceiling.
+    """
+
+    try:
+        config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    model_type = str(config.get("model_type", "")).replace("-", "_").lower()
+    if model_type != "qwen4_exp":
+        return 0
+    from ..patches.mlx_vlm_qwen4_exp_compat.residency import (
+        qwen4_exp_residency_estimate,
+    )
+
+    estimate = qwen4_exp_residency_estimate(model_path)
+    return int(estimate.ple_bytes) if estimate.supported else 0
 
 
 def estimate_for_model_settings(
@@ -95,7 +121,8 @@ def estimate_expert_streaming_residency(
         raise ValueError("Expert streaming mode must be soft_reap or cache_only")
     checkpoint_bytes = sum(file.stat().st_size for file in path.glob("*.safetensors"))
     streamed_tensor_bytes = sum(index.streamed_storage_bytes(layer) for layer in layers)
-    fixed_bytes = max(0, checkpoint_bytes - streamed_tensor_bytes)
+    mmap_bytes = _forced_mmap_bytes(path)
+    fixed_bytes = max(0, checkpoint_bytes - streamed_tensor_bytes - mmap_bytes)
     per_layer_expert_bytes = {
         layer: index.expert_storage_bytes(layer) for layer in layers
     }
@@ -130,6 +157,7 @@ def estimate_expert_streaming_residency(
         checkpoint_bytes=checkpoint_bytes,
         streamed_tensor_bytes=streamed_tensor_bytes,
         fixed_bytes=fixed_bytes,
+        mmap_bytes=mmap_bytes,
         pinned_bytes=pinned_bytes,
         cache_bytes=cache_bytes,
         scratch_bytes=scratch_bytes,
