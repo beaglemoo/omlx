@@ -752,10 +752,19 @@ class StreamingSwitchGLU(nn.Module):
             return slots
 
     def _ensure_native(self, indices: mx.array) -> mx.array:
-        from omlx.custom_kernels.fast_resource_loading import resolve_route_async
+        from omlx.custom_kernels.fast_resource_loading import (
+            check_async_route_error,
+            resolve_route_async,
+        )
 
         if resolve_route_async is None or self._native_demand_callback is None:
             raise RuntimeError("Native expert demand resolver is unavailable")
+        # A failed callback fills the previous route with -1 slots and parks
+        # the error in the extension. Raise it here, on the inference thread,
+        # before another route is submitted, instead of dispatching gather_qmm
+        # with out-of-range expert indices and returning garbage tokens.
+        if check_async_route_error is not None:
+            check_async_route_error()
         entry, mapped = resolve_route_async(
             indices,
             self._slot_map,

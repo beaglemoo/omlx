@@ -126,7 +126,6 @@ class AsyncRoutePrimitive : public mx::Primitive {
     const mx::array resident = inputs[2];
     mx::array entry = outputs[0];
     mx::array final = outputs[1];
-    int32_t* entry_ptr = entry.data<int32_t>();
     int32_t* final_ptr = final.data<int32_t>();
     const uint32_t* index_ptr = indices.data<uint32_t>();
     const size_t count = indices.size();
@@ -165,40 +164,16 @@ class AsyncRoutePrimitive : public mx::Primitive {
     auto state = state_;
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
       @autoreleasepool {
-        bool all_resident = true;
-        for (size_t index = 0; index < count; ++index) {
-          all_resident = all_resident && entry_ptr[index] >= 0;
-        }
-        if (all_resident) {
-          std::memcpy(final_ptr, entry_ptr, count * sizeof(int32_t));
-          // Exact resident rows need no publication. Release the dependent
-          // MoE immediately; LRU/hotness accounting below is deliberately
-          // asynchronous and has an entire backbone traversal to finish
-          // before this layer can be routed again.
-          [state->event setSignaledValue:state->value];
-          // Never leave a completed Metal command buffer waiting for the
-          // Python GIL merely to update hit/LRU accounting.  MLX may wait for
-          // completion while its Python binding owns the GIL; blocking this
-          // queue here can therefore deadlock a later exact-demand miss.
-          auto route_values = std::make_shared<std::vector<uint32_t>>(
-              index_ptr, index_ptr + count);
-          dispatch_async(g_async_route_accounting_queue, ^{
-            @autoreleasepool {
-              try {
-                nb::gil_scoped_acquire acquire;
-                nb::object callback = nb::borrow<nb::object>(state->callback);
-                nb::list values;
-                for (uint32_t value : *route_values) {
-                  values.append(nb::int_(value));
-                }
-                callback(values);
-              } catch (const std::exception& error) {
-                record_async_route_error(error.what());
-              }
-            }
-          });
-          return;
-        }
+        // Every route goes through the Python callback, even when the GPU
+        // remap above reports all rows resident.  The slot map and resident
+        // mask this kernel read were captured when the decode graph was
+        // built, and mlx-lm pipelines decode one step ahead: step t+1's graph
+        // is built while step t's completion handlers are still loading and
+        // evicting experts.  A "resident" verdict from that stale snapshot can
+        // name a slot that has since been refilled with a different expert,
+        // which silently corrupts the output.  The callback resolves against
+        // the pool's live CPU state under its lock, so it is always exact;
+        // resident routes cost one GIL hop and no I/O.
         try {
           nb::gil_scoped_acquire acquire;
           nb::object callback = nb::borrow<nb::object>(state->callback);
