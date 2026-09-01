@@ -8,6 +8,7 @@ try:
         abi_probe,
         check_async_route_error,
         eval_with_gil_released,
+        publish_route_maps,
         resolve_route_async,
         synchronize_with_gil_released,
     )
@@ -18,6 +19,7 @@ except Exception as exc:  # pragma: no cover - depends on optional native build
     abi_probe = None  # type: ignore[assignment]
     check_async_route_error = None  # type: ignore[assignment]
     eval_with_gil_released = None  # type: ignore[assignment]
+    publish_route_maps = None  # type: ignore[assignment]
     resolve_route_async = None  # type: ignore[assignment]
     synchronize_with_gil_released = None  # type: ignore[assignment]
     _IMPORT_ERROR = exc
@@ -46,6 +48,7 @@ __all__ = [
     "check_async_route_error",
     "eval_with_gil_released",
     "import_error",
+    "publish_route_maps",
     "resolve_route_async",
     "synchronize_with_gil_released",
 ]

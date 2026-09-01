@@ -349,6 +349,32 @@ class StreamingSwitchGLU(nn.Module):
     def all_experts_resident(self) -> bool:
         return len(self._expert_to_slot) == self.num_experts
 
+    def _publish_route_maps(self) -> None:
+        """Push the CPU route maps to the arrays the remap kernel binds.
+
+        With native demand the maps are overwritten in place so a decode
+        graph built one step ahead (mlx-lm pipelines with ``async_eval``)
+        still reads current residency when its remap kernel executes.
+        Re-allocating them would hand that graph a stale snapshot, and a
+        stale "resident" verdict can name a slot since refilled with another
+        expert. Without the native bridge a fresh array is equivalent, since
+        every route is then resolved synchronously on the CPU.
+        """
+
+        if self._native_demand:
+            from omlx.custom_kernels.fast_resource_loading import publish_route_maps
+
+            if publish_route_maps is not None:
+                publish_route_maps(
+                    self._slot_map,
+                    self._resident_mask,
+                    self._slot_map_np.tobytes(),
+                    self._resident_mask_np.tobytes(),
+                )
+                return
+        self._resident_mask = mx.array(self._resident_mask_np)
+        self._slot_map = mx.array(self._slot_map_np)
+
     def set_execution_mode(self, mode: str) -> None:
         if mode not in {"checked", "resident"}:
             raise ValueError(f"Unknown expert streaming execution mode: {mode}")
@@ -406,8 +432,7 @@ class StreamingSwitchGLU(nn.Module):
             self.scratch_slots = self._prefill_scratch_slots
             self._elastic_decode_cache_active = False
             self.stats.elastic_decode_cache_demotions += 1
-            self._resident_mask = mx.array(self._resident_mask_np)
-            self._slot_map = mx.array(self._slot_map_np)
+            self._publish_route_maps()
         self._last_indices = None
         self._last_slots = None
         self._last_values = None
@@ -695,8 +720,7 @@ class StreamingSwitchGLU(nn.Module):
             self._slot_map_np[expert] = slot
             self._dynamic_lru[expert] = slot
             slots.append(slot)
-        self._resident_mask = mx.array(self._resident_mask_np)
-        self._slot_map = mx.array(self._slot_map_np)
+        self._publish_route_maps()
         return slots
 
     def _ensure_values(

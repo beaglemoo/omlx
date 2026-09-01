@@ -128,6 +128,7 @@ class AsyncRoutePrimitive : public mx::Primitive {
     const mx::array resident = inputs[2];
     mx::array entry = outputs[0];
     mx::array final = outputs[1];
+    int32_t* entry_ptr = entry.data<int32_t>();
     int32_t* final_ptr = final.data<int32_t>();
     const uint32_t* index_ptr = indices.data<uint32_t>();
     const size_t count = indices.size();
@@ -166,16 +167,41 @@ class AsyncRoutePrimitive : public mx::Primitive {
     auto state = state_;
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
       @autoreleasepool {
-        // Every route goes through the Python callback, even when the GPU
-        // remap above reports all rows resident.  The slot map and resident
-        // mask this kernel read were captured when the decode graph was
-        // built, and mlx-lm pipelines decode one step ahead: step t+1's graph
-        // is built while step t's completion handlers are still loading and
-        // evicting experts.  A "resident" verdict from that stale snapshot can
-        // name a slot that has since been refilled with a different expert,
-        // which silently corrupts the output.  The callback resolves against
-        // the pool's live CPU state under its lock, so it is always exact;
-        // resident routes cost one GIL hop and no I/O.
+        // The remap kernel above read the pool's live slot map and resident
+        // mask (updated in place by publish_route_maps, never re-allocated),
+        // so its verdict reflects residency at execution time.  Ordering:
+        // this layer's previous callback wrote the maps before signalling
+        // the event its MoE waits on, and this command buffer was encoded
+        // after that MoE, so it observes those writes.  A resident verdict
+        // therefore needs no Python and no I/O: release the MoE at once and
+        // account the hits asynchronously.  Anything else resolves through
+        // the callback under the pool lock.
+        bool all_resident = true;
+        for (size_t index = 0; index < count; ++index) {
+          all_resident = all_resident && entry_ptr[index] >= 0;
+        }
+        if (all_resident) {
+          std::memcpy(final_ptr, entry_ptr, count * sizeof(int32_t));
+          [state->event setSignaledValue:state->value];
+          auto route_values = std::make_shared<std::vector<uint32_t>>(
+              index_ptr, index_ptr + count);
+          dispatch_async(g_async_route_accounting_queue, ^{
+            @autoreleasepool {
+              try {
+                nb::gil_scoped_acquire acquire;
+                nb::object callback = nb::borrow<nb::object>(state->callback);
+                nb::list values;
+                for (uint32_t value : *route_values) {
+                  values.append(nb::int_(value));
+                }
+                callback(values);
+              } catch (const std::exception& error) {
+                record_async_route_error(error.what());
+              }
+            }
+          });
+          return;
+        }
         try {
           nb::gil_scoped_acquire acquire;
           nb::object callback = nb::borrow<nb::object>(state->callback);
@@ -259,8 +285,17 @@ static std::pair<mx::array, mx::array> resolve_route_async(
   }
   mx::Stream stream = mx::to_stream(mx::Device::gpu);
   mx::array contiguous = mx::contiguous(indices, false, stream);
-  mx::array contiguous_slots = mx::contiguous(slot_map, false, stream);
-  mx::array contiguous_resident = mx::contiguous(resident, false, stream);
+  // The slot map and resident mask are the pool's live route maps: the
+  // pool overwrites them in place (publish_route_maps) so the remap kernel
+  // reads the current residency when it executes, not a snapshot taken
+  // when the decode graph was built. Bind them directly when they are
+  // already row-contiguous; a copy would freeze them again.
+  mx::array contiguous_slots = slot_map.flags().row_contiguous
+      ? slot_map
+      : mx::contiguous(slot_map, false, stream);
+  mx::array contiguous_resident = resident.flags().row_contiguous
+      ? resident
+      : mx::contiguous(resident, false, stream);
   if (contiguous_slots.dtype() != mx::int32 ||
       contiguous_resident.dtype() != mx::bool_) {
     throw std::invalid_argument(
@@ -277,6 +312,34 @@ static std::pair<mx::array, mx::array> resolve_route_async(
       std::make_shared<AsyncRouteWaitPrimitive>(stream, state),
       {raw[1]});
   return {raw[0], gated};
+}
+
+static void publish_route_maps(
+    const mx::array& slot_map,
+    const mx::array& resident,
+    nb::bytes slots,
+    nb::bytes mask) {
+  // Overwrite the pool's route maps in place. Both arrays live in shared
+  // Metal storage, so the CPU write is visible to the next remap kernel
+  // that binds them; see AsyncRoutePrimitive for the ordering argument.
+  if (slot_map.dtype() != mx::int32 || resident.dtype() != mx::bool_) {
+    throw std::invalid_argument(
+        "Route maps must be an int32 slot map and a boolean resident mask");
+  }
+  if (!slot_map.flags().row_contiguous || !resident.flags().row_contiguous) {
+    throw std::invalid_argument("Route maps must be row-contiguous");
+  }
+  if (slot_map.status() == mx::array::unscheduled ||
+      resident.status() == mx::array::unscheduled) {
+    throw std::invalid_argument("Route maps must be evaluated before publishing");
+  }
+  if (slots.size() != slot_map.nbytes() || mask.size() != resident.nbytes()) {
+    throw std::invalid_argument("Route map payload size mismatch");
+  }
+  std::memcpy(
+      const_cast<int32_t*>(slot_map.data<int32_t>()), slots.c_str(), slots.size());
+  std::memcpy(
+      const_cast<bool*>(resident.data<bool>()), mask.c_str(), mask.size());
 }
 
 static void check_async_route_error() {
@@ -834,6 +897,13 @@ NB_MODULE(_ext, m) {
       "callback"_a);
   m.def("check_async_route_error", &check_async_route_error);
   m.def("eval_with_gil_released", &eval_with_gil_released);
+  m.def(
+      "publish_route_maps",
+      &publish_route_maps,
+      nb::arg("slot_map"),
+      nb::arg("resident"),
+      nb::arg("slots"),
+      nb::arg("mask"));
   m.def(
       "synchronize_with_gil_released",
       &synchronize_with_gil_released,

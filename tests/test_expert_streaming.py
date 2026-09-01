@@ -438,6 +438,59 @@ def test_native_demand_patches_synchronize_until_last_runtime_closes(tmp_path):
         plain.close()
 
 
+def test_execution_releases_pool_after_prefill_passes_only(tmp_path, monkeypatch):
+    from omlx.expert_streaming import execution as execution_module
+
+    _checkpoint(tmp_path)
+    model = _streamable_test_model()
+    runtime = install_expert_streaming(
+        model, tmp_path, None, cache_experts=2, streaming_mode="cache_only"
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(execution_module.mx, "clear_cache", lambda: calls.append("clear"))
+    try:
+        prefill = mx.zeros((1, 8), dtype=mx.uint32)
+        decode = mx.zeros((1, 1), dtype=mx.uint32)
+        runtime.execution.execute_call(model, lambda: None, (prefill,), {})
+        assert calls == ["clear"], "prefill pass must return the pool"
+        runtime.execution.execute_call(model, lambda: None, (decode,), {})
+        assert calls == ["clear"], "decode pass must keep warm buffers"
+    finally:
+        runtime.close()
+
+
+def test_native_demand_route_maps_are_updated_in_place(tmp_path):
+    from omlx.custom_kernels.fast_resource_loading import available
+
+    if not available():
+        pytest.skip("Fast Resource Loading extension unavailable")
+    _checkpoint(tmp_path)
+    runtime = install_expert_streaming(
+        _streamable_test_model(),
+        tmp_path,
+        None,
+        cache_experts=2,
+        streaming_mode="cache_only",
+        fast_resource_loading=True,
+        direct_io=True,
+        native_demand=True,
+    )
+    try:
+        pool = runtime.pools[0]
+        slot_map, resident = pool._slot_map, pool._resident_mask
+        before = set(pool._expert_to_slot)
+        missing = [e for e in range(pool.num_experts) if e not in before][:1]
+        pool._ensure_values(tuple(missing), destinations_idle=True)
+        # Same array objects, new contents: a pipelined graph holding these
+        # arrays sees the update when its remap kernel runs.
+        assert pool._slot_map is slot_map and pool._resident_mask is resident
+        assert slot_map.tolist() == pool._slot_map_np.tolist()
+        assert resident.tolist() == pool._resident_mask_np.tolist()
+        assert resident.tolist()[missing[0]] is True
+    finally:
+        runtime.close()
+
+
 def test_fast_resource_loading_writes_exact_preallocated_bank_rows(tmp_path):
     from omlx.custom_kernels.fast_resource_loading import available
 
