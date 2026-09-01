@@ -11,6 +11,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -335,6 +337,39 @@ static void synchronize_with_gil_released(nb::object stream) {
   }
 }
 
+// Wait for a Metal IO command buffer without holding the GIL.  Loads can
+// take seconds for multi-GiB tickets, and holding the GIL for that long
+// freezes every other Python thread (the asyncio server included).  A
+// bounded wait also turns a stalled IO queue into a load error with the
+// ticket's accounting attached instead of a process that never returns.
+static double io_wait_clock_now() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+static void wait_io_command_buffer(
+    id<MTLIOCommandBuffer> command_buffer,
+    double timeout_seconds,
+    const char* what) {
+  nb::gil_scoped_release release;
+  const double started = io_wait_clock_now();
+  while (true) {
+    const MTLIOStatus status = command_buffer.status;
+    if (status == MTLIOStatusComplete ||
+        status == MTLIOStatusError ||
+        status == MTLIOStatusCancelled) {
+      return;
+    }
+    if (io_wait_clock_now() - started > timeout_seconds) {
+      throw std::runtime_error(
+          std::string(what) + " did not complete within " +
+          std::to_string(static_cast<long>(timeout_seconds)) + " s");
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+}
+
 struct LoadTicket {
   id<MTLBuffer> staging = nil;
   id<MTLBuffer> status = nil;
@@ -537,7 +572,8 @@ class FastResourceLoader {
         throw std::invalid_argument("Fast resource load ticket is already finished");
       }
       const auto io_started = clock_now();
-      [ticket->command_buffer waitUntilCompleted];
+      wait_io_command_buffer(
+          ticket->command_buffer, 120.0, "Metal IO command buffer");
       const double io_seconds = clock_now() - io_started;
       record_completion(ticket, queue_stats_);
       const uint32_t status = *static_cast<uint32_t*>(ticket->status.contents);
@@ -658,7 +694,10 @@ class FastResourceLoader {
         [encoder endEncoding];
       }
       [command_buffer commit];
-      [command_buffer waitUntilCompleted];
+      {
+        nb::gil_scoped_release release;
+        [command_buffer waitUntilCompleted];
+      }
       const double copy_seconds = clock_now() - copy_started;
       if (command_buffer.status == MTLCommandBufferStatusError) {
         throw std::runtime_error(
