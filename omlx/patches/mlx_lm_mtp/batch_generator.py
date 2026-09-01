@@ -90,7 +90,11 @@ def _native_expert_demand_enabled(model: Any) -> bool:
     candidates = [model]
     for name in ("_vlm_model", "_language_model", "language_model"):
         candidate = getattr(model, name, None)
-        if candidate is not None and candidate not in candidates:
+        # Identity check: nn.Module is a dict subclass, so ``in`` would fall
+        # back to a deep dict comparison over parameter arrays.
+        if candidate is not None and not any(
+            candidate is existing for existing in candidates
+        ):
             candidates.append(candidate)
     return any(
         bool(
