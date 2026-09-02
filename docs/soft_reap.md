@@ -81,6 +81,45 @@ Runtime statistics include cache hits and misses, just-in-time loads, SSD bytes 
 operations, native-demand callbacks, direct-load counts, I/O timing, and elastic
 cache transitions. Admin benchmark snapshots include these counters.
 
+## Runtime notes
+
+- While at least one native-demand runtime is installed, `mlx.core.synchronize`
+  is replaced by a variant that releases the GIL. A native-demand miss is
+  resolved inside a Metal completion handler that needs the GIL, and the
+  stock call waits with the GIL held, which deadlocks the process. The
+  original is restored when the last runtime closes.
+- The remap kernel binds the pool's route maps directly and the pool updates
+  them in place, so a decode graph built one step ahead still reads current
+  residency when it executes. Resident routes therefore release the MoE from
+  the completion handler without entering Python.
+- Fast Resource Loading waits on Metal IO tickets without the GIL and fails a
+  ticket that does not complete within 120 s instead of blocking the server.
+- The runtime drains the stream and clears the MLX buffer cache after every
+  non-decode pass, since a streamed prefill chunk otherwise leaves several
+  GiB of short-lived buffers in the pool and the prefill memory guard prices
+  them as the next chunk's transient.
+- For Qwen4-Exp checkpoints the PLE always takes its mmap path under
+  streaming and is excluded from the residency estimate.
+
+## Sizing guidance
+
+Measured on a 64 GB M5 Pro (Qwen3.8 Flash Next oQ2, 48 layers of 512
+experts, top-10; 1024-token prompt, 256 generated, MTP depth 3):
+
+| Cache experts per layer | Resident | Hit rate | Decode tok/s |
+| ---: | ---: | ---: | ---: |
+| 288 | 32.6 GB | 0.65 | 25 |
+| 352 | 37.6 GB | 0.97 | 26 |
+| 416 | 42.9 GB | 0.995 | 29 to 35 |
+
+Above roughly 400 experts the SSD stops mattering and decode is bounded by
+the per-layer host round trip that resolves misses; GPU utilization sits
+near 65 percent while an eager load of the same model reaches 98 percent.
+When every expert is resident the pool switches to its resident mode and
+matches eager speed, but that needs the whole expert set plus, for Qwen4-Exp,
+page cache for the mmapped PLE. Larger scratch banks slowed prompt
+processing; route-frequency eviction beat LRU on DeepSeek V4 Flash.
+
 ## Benchmarking
 
 `benchmarks/soft_reap_streaming.py` reports projected residency, validates direct
