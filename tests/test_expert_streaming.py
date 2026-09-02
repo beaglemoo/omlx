@@ -239,6 +239,47 @@ def test_cache_only_residency_requires_no_manifest(tmp_path):
     assert estimate.cache_slots_per_layer == 2
 
 
+def test_qwen4_exp_residency_excludes_forced_mmap_ple(tmp_path):
+    _checkpoint(tmp_path)
+    ple = {
+        "language_model.model.layers.0.ple.ngram_embedding.weight": mx.zeros(
+            (4096, 64), dtype=mx.float16
+        )
+    }
+    ple_shard = "model-00002-of-00002.safetensors"
+    mx.save_safetensors(str(tmp_path / ple_shard), ple, metadata={"format": "mlx"})
+    index_path = tmp_path / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"].update({key: ple_shard for key in ple})
+    index_path.write_text(json.dumps(index))
+    ple_bytes = 4096 * 64 * 2
+
+    def estimate(model_type):
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+        return estimate_expert_streaming_residency(
+            tmp_path,
+            None,
+            cache_experts=2,
+            scratch_experts=0,
+            num_layers=1,
+            num_experts=6,
+            top_k=2,
+            streaming_mode="cache_only",
+        )
+
+    plain = estimate("qwen3_5_moe")
+    qwen4 = estimate("qwen4_exp")
+
+    # Streaming forces the Qwen4-Exp PLE onto mmap, so it must not be charged
+    # as resident; any other architecture keeps the full fixed trunk.
+    assert plain.mmap_bytes == 0
+    assert qwen4.mmap_bytes == ple_bytes
+    assert plain.fixed_bytes - qwen4.fixed_bytes == ple_bytes
+    assert plain.resident_bytes - qwen4.resident_bytes == pytest.approx(
+        ple_bytes * 1.05, abs=1
+    )
+
+
 def test_cold_reader_coalesces_small_gaps_without_affecting_direct_preload(tmp_path):
     _checkpoint(tmp_path)
     index = SafetensorExpertIndex(tmp_path)
@@ -342,6 +383,112 @@ def test_cache_only_install_requires_no_manifest(tmp_path):
     assert model.layers[0].mlp.switch_mlp is original_switch
     assert not hasattr(model, "_omlx_expert_streaming_runtime")
     assert type(model).__call__ is original_call
+
+
+def test_native_demand_patches_synchronize_until_last_runtime_closes(tmp_path):
+    from omlx.custom_kernels.fast_resource_loading import available
+
+    if not available():
+        pytest.skip("Fast Resource Loading extension unavailable")
+    original = mx.synchronize
+    _checkpoint(tmp_path)
+    kwargs = dict(
+        cache_experts=2,
+        streaming_mode="cache_only",
+        fast_resource_loading=True,
+        direct_io=True,
+        native_demand=True,
+    )
+    first = install_expert_streaming(_streamable_test_model(), tmp_path, None, **kwargs)
+    try:
+        assert mx.synchronize is not original
+        assert mx.synchronize.__wrapped__ is original
+        second = install_expert_streaming(
+            _streamable_test_model(), tmp_path, None, **kwargs
+        )
+        try:
+            # The GIL-releasing variant must still be a working barrier.
+            value = mx.random.normal((64, 64)) @ mx.random.normal((64, 64))
+            mx.async_eval(value)
+            mx.synchronize()
+            mx.synchronize(mx.default_stream(mx.default_device()))
+            mx.synchronize(mx.default_device())
+            mx.synchronize(mx.new_thread_local_stream(mx.default_device()))
+            with pytest.raises(TypeError):
+                mx.synchronize("not a stream")
+            assert value.shape == (64, 64)
+        finally:
+            second.close()
+        assert mx.synchronize is not original
+    finally:
+        first.close()
+    assert mx.synchronize is original
+
+    # Without native demand the module is left untouched.
+    plain = install_expert_streaming(
+        _streamable_test_model(),
+        tmp_path,
+        None,
+        cache_experts=2,
+        streaming_mode="cache_only",
+    )
+    try:
+        assert mx.synchronize is original
+    finally:
+        plain.close()
+
+
+def test_execution_releases_pool_after_prefill_passes_only(tmp_path, monkeypatch):
+    from omlx.expert_streaming import execution as execution_module
+
+    _checkpoint(tmp_path)
+    model = _streamable_test_model()
+    runtime = install_expert_streaming(
+        model, tmp_path, None, cache_experts=2, streaming_mode="cache_only"
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(execution_module.mx, "clear_cache", lambda: calls.append("clear"))
+    try:
+        prefill = mx.zeros((1, 8), dtype=mx.uint32)
+        decode = mx.zeros((1, 1), dtype=mx.uint32)
+        runtime.execution.execute_call(model, lambda: None, (prefill,), {})
+        assert calls == ["clear"], "prefill pass must return the pool"
+        runtime.execution.execute_call(model, lambda: None, (decode,), {})
+        assert calls == ["clear"], "decode pass must keep warm buffers"
+    finally:
+        runtime.close()
+
+
+def test_native_demand_route_maps_are_updated_in_place(tmp_path):
+    from omlx.custom_kernels.fast_resource_loading import available
+
+    if not available():
+        pytest.skip("Fast Resource Loading extension unavailable")
+    _checkpoint(tmp_path)
+    runtime = install_expert_streaming(
+        _streamable_test_model(),
+        tmp_path,
+        None,
+        cache_experts=2,
+        streaming_mode="cache_only",
+        fast_resource_loading=True,
+        direct_io=True,
+        native_demand=True,
+    )
+    try:
+        pool = runtime.pools[0]
+        slot_map, resident = pool._slot_map, pool._resident_mask
+        before = set(pool._expert_to_slot)
+        missing = [e for e in range(pool.num_experts) if e not in before][:1]
+        pool._ensure_values(tuple(missing), destinations_idle=True)
+        # Same array objects, new contents: a pipelined graph holding these
+        # arrays sees the update when its remap kernel runs.
+        assert pool._slot_map is slot_map and pool._resident_mask is resident
+        assert slot_map.tolist() == pool._slot_map_np.tolist()
+        assert resident.tolist() == pool._resident_mask_np.tolist()
+        assert resident.tolist()[missing[0]] is True
+    finally:
+        runtime.close()
 
 
 def test_fast_resource_loading_writes_exact_preallocated_bank_rows(tmp_path):

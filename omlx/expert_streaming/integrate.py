@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import weakref
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -23,6 +24,63 @@ from .pool import StreamingSwitchGLU
 from .safetensors import ExpertReader, SafetensorExpertIndex
 
 logger = logging.getLogger(__name__)
+
+
+class _NativeDemandSynchronizePatch:
+    """Swap ``mlx.core.synchronize`` for a GIL-releasing variant.
+
+    ``mx.eval`` releases the GIL while it waits for Metal, but
+    ``mx.synchronize`` does not. A native-demand miss is resolved inside a
+    Metal completion handler that must take the GIL to publish the missing
+    expert rows, and ``waitUntilCompleted`` only returns after completion
+    handlers have run. Any ``mx.synchronize()`` issued while such a command
+    buffer is in flight (mlx-vlm's ``wired_limit`` exit, the engine pool's
+    unload path, the scheduler's stream barriers) therefore deadlocks the
+    process. While at least one native-demand runtime is installed, route
+    every ``mx.synchronize`` call through the extension so the wait happens
+    without the GIL; restore the original when the last runtime closes.
+    """
+
+    _lock = threading.Lock()
+    _depth = 0
+    _original: Any = None
+
+    @classmethod
+    def acquire(cls) -> None:
+        from omlx.custom_kernels.fast_resource_loading import (
+            synchronize_with_gil_released,
+        )
+
+        if synchronize_with_gil_released is None:
+            raise RuntimeError(
+                "Native expert demand requires the Fast Resource Loading extension"
+            )
+        with cls._lock:
+            if cls._depth == 0:
+                cls._original = mx.synchronize
+
+                def synchronize(stream: Any = None) -> None:
+                    synchronize_with_gil_released(stream)
+
+                synchronize.__doc__ = getattr(cls._original, "__doc__", None)
+                synchronize.__wrapped__ = cls._original  # type: ignore[attr-defined]
+                mx.synchronize = synchronize
+            cls._depth += 1
+
+    @classmethod
+    def release(cls) -> None:
+        with cls._lock:
+            if cls._depth == 0:
+                return
+            cls._depth -= 1
+            if cls._depth == 0 and cls._original is not None:
+                mx.synchronize = cls._original
+                cls._original = None
+
+    @classmethod
+    def active(cls) -> bool:
+        with cls._lock:
+            return cls._depth > 0
 
 
 @dataclass
@@ -52,6 +110,7 @@ class ExpertStreamingRuntime:
     hotlist_profile_error: str | None = None
     execution: ExpertStreamingExecution | None = None
     _attached_models: list[weakref.ReferenceType[Any]] = field(default_factory=list)
+    _synchronize_patched: bool = False
 
     def attach_model(self, model: Any) -> None:
         model._omlx_expert_streaming_runtime = self
@@ -224,6 +283,9 @@ class ExpertStreamingRuntime:
         self._save_hotlist()
         if self.execution is not None:
             self.execution.close()
+        if self._synchronize_patched:
+            self._synchronize_patched = False
+            _NativeDemandSynchronizePatch.release()
         for reference in self._attached_models:
             model = reference()
             if (
@@ -470,6 +532,9 @@ def install_expert_streaming(
         hotlist_profile_error=hotlist_profile_error,
     )
     try:
+        if native_demand:
+            _NativeDemandSynchronizePatch.acquire()
+            runtime._synchronize_patched = True
         runtime.attach_model(model)
         language_model = getattr(model, "language_model", None)
         if language_model is not None and language_model is not model:

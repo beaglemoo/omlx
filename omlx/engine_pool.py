@@ -426,12 +426,13 @@ class EnginePool:
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
         )
-        # A valid Soft-REAP layout can make the complete PLE-resident model fit.
-        # Only preserve a forced PLE mmap decision if that reduced layout still
-        # exceeds the configured ceiling; an explicit user request remains valid.
-        streaming = self._expert_streaming_estimate(entry, settings)
-        if streaming is not None and (ceiling <= 0 or streaming.resident_bytes <= ceiling):
-            forced = False
+        # Expert streaming always routes the PLE through mmap
+        # (``configure_qwen4_exp_runtime(mode="mmap")`` in
+        # ``maybe_apply_pre_load_patches``), and the streaming residency
+        # estimate already excludes it. Report that as forced so the pool, the
+        # Admin API, and the loader agree on what will actually be resident.
+        if self._expert_streaming_estimate(entry, settings) is not None:
+            forced = estimate.supported
         return requested or forced, forced, estimate if estimate.supported else None
 
     def _effective_qwen4_model_settings(

@@ -8,8 +8,11 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -164,21 +167,22 @@ class AsyncRoutePrimitive : public mx::Primitive {
     auto state = state_;
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
       @autoreleasepool {
+        // The remap kernel above read the pool's live slot map and resident
+        // mask (updated in place by publish_route_maps, never re-allocated),
+        // so its verdict reflects residency at execution time.  Ordering:
+        // this layer's previous callback wrote the maps before signalling
+        // the event its MoE waits on, and this command buffer was encoded
+        // after that MoE, so it observes those writes.  A resident verdict
+        // therefore needs no Python and no I/O: release the MoE at once and
+        // account the hits asynchronously.  Anything else resolves through
+        // the callback under the pool lock.
         bool all_resident = true;
         for (size_t index = 0; index < count; ++index) {
           all_resident = all_resident && entry_ptr[index] >= 0;
         }
         if (all_resident) {
           std::memcpy(final_ptr, entry_ptr, count * sizeof(int32_t));
-          // Exact resident rows need no publication. Release the dependent
-          // MoE immediately; LRU/hotness accounting below is deliberately
-          // asynchronous and has an entire backbone traversal to finish
-          // before this layer can be routed again.
           [state->event setSignaledValue:state->value];
-          // Never leave a completed Metal command buffer waiting for the
-          // Python GIL merely to update hit/LRU accounting.  MLX may wait for
-          // completion while its Python binding owns the GIL; blocking this
-          // queue here can therefore deadlock a later exact-demand miss.
           auto route_values = std::make_shared<std::vector<uint32_t>>(
               index_ptr, index_ptr + count);
           dispatch_async(g_async_route_accounting_queue, ^{
@@ -281,8 +285,17 @@ static std::pair<mx::array, mx::array> resolve_route_async(
   }
   mx::Stream stream = mx::to_stream(mx::Device::gpu);
   mx::array contiguous = mx::contiguous(indices, false, stream);
-  mx::array contiguous_slots = mx::contiguous(slot_map, false, stream);
-  mx::array contiguous_resident = mx::contiguous(resident, false, stream);
+  // The slot map and resident mask are the pool's live route maps: the
+  // pool overwrites them in place (publish_route_maps) so the remap kernel
+  // reads the current residency when it executes, not a snapshot taken
+  // when the decode graph was built. Bind them directly when they are
+  // already row-contiguous; a copy would freeze them again.
+  mx::array contiguous_slots = slot_map.flags().row_contiguous
+      ? slot_map
+      : mx::contiguous(slot_map, false, stream);
+  mx::array contiguous_resident = resident.flags().row_contiguous
+      ? resident
+      : mx::contiguous(resident, false, stream);
   if (contiguous_slots.dtype() != mx::int32 ||
       contiguous_resident.dtype() != mx::bool_) {
     throw std::invalid_argument(
@@ -299,6 +312,34 @@ static std::pair<mx::array, mx::array> resolve_route_async(
       std::make_shared<AsyncRouteWaitPrimitive>(stream, state),
       {raw[1]});
   return {raw[0], gated};
+}
+
+static void publish_route_maps(
+    const mx::array& slot_map,
+    const mx::array& resident,
+    nb::bytes slots,
+    nb::bytes mask) {
+  // Overwrite the pool's route maps in place. Both arrays live in shared
+  // Metal storage, so the CPU write is visible to the next remap kernel
+  // that binds them; see AsyncRoutePrimitive for the ordering argument.
+  if (slot_map.dtype() != mx::int32 || resident.dtype() != mx::bool_) {
+    throw std::invalid_argument(
+        "Route maps must be an int32 slot map and a boolean resident mask");
+  }
+  if (!slot_map.flags().row_contiguous || !resident.flags().row_contiguous) {
+    throw std::invalid_argument("Route maps must be row-contiguous");
+  }
+  if (slot_map.status() == mx::array::unscheduled ||
+      resident.status() == mx::array::unscheduled) {
+    throw std::invalid_argument("Route maps must be evaluated before publishing");
+  }
+  if (slots.size() != slot_map.nbytes() || mask.size() != resident.nbytes()) {
+    throw std::invalid_argument("Route map payload size mismatch");
+  }
+  std::memcpy(
+      const_cast<int32_t*>(slot_map.data<int32_t>()), slots.c_str(), slots.size());
+  std::memcpy(
+      const_cast<bool*>(resident.data<bool>()), mask.c_str(), mask.size());
 }
 
 static void check_async_route_error() {
@@ -323,6 +364,73 @@ static void eval_with_gil_released(const nb::args& values) {
   // GIL so the exact-demand callback can publish the missing rows.
   nb::gil_scoped_release release;
   mx::eval(std::move(arrays));
+}
+
+static void synchronize_with_gil_released(nb::object stream) {
+  // mx.synchronize() holds the GIL while it blocks in waitUntilCompleted.
+  // If the pending command buffer carries an exact-demand miss, its Metal
+  // completion handler needs the GIL to publish the missing rows, and the
+  // process deadlocks.  Resolve the stream while the GIL is held, then wait
+  // without it.  See eval_with_gil_released for the eval() counterpart.
+  // Accept everything mx.synchronize() accepts: a Stream, a
+  // ThreadLocalStream (mlx-lm/mlx-vlm generation streams), a Device, or None.
+  std::optional<mx::Stream> target;
+  std::optional<mx::ThreadLocalStream> thread_local_target;
+  if (nb::isinstance<mx::ThreadLocalStream>(stream)) {
+    thread_local_target = nb::cast<mx::ThreadLocalStream>(stream);
+  } else if (nb::isinstance<mx::Stream>(stream)) {
+    target = nb::cast<mx::Stream>(stream);
+  } else if (nb::isinstance<mx::Device>(stream)) {
+    target = mx::default_stream(nb::cast<mx::Device>(stream));
+  } else if (nb::isinstance<mx::Device::DeviceType>(stream)) {
+    target = mx::default_stream(
+        mx::Device(nb::cast<mx::Device::DeviceType>(stream)));
+  } else if (!stream.is_none()) {
+    throw nb::type_error(
+        "synchronize_with_gil_released expects a Stream, ThreadLocalStream, "
+        "Device, or None");
+  }
+  nb::gil_scoped_release release;
+  if (thread_local_target) {
+    mx::synchronize(*thread_local_target);
+  } else if (target) {
+    mx::synchronize(*target);
+  } else {
+    mx::synchronize();
+  }
+}
+
+// Wait for a Metal IO command buffer without holding the GIL.  Loads can
+// take seconds for multi-GiB tickets, and holding the GIL for that long
+// freezes every other Python thread (the asyncio server included).  A
+// bounded wait also turns a stalled IO queue into a load error with the
+// ticket's accounting attached instead of a process that never returns.
+static double io_wait_clock_now() {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+static void wait_io_command_buffer(
+    id<MTLIOCommandBuffer> command_buffer,
+    double timeout_seconds,
+    const char* what) {
+  nb::gil_scoped_release release;
+  const double started = io_wait_clock_now();
+  while (true) {
+    const MTLIOStatus status = command_buffer.status;
+    if (status == MTLIOStatusComplete ||
+        status == MTLIOStatusError ||
+        status == MTLIOStatusCancelled) {
+      return;
+    }
+    if (io_wait_clock_now() - started > timeout_seconds) {
+      throw std::runtime_error(
+          std::string(what) + " did not complete within " +
+          std::to_string(static_cast<long>(timeout_seconds)) + " s");
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
 }
 
 struct LoadTicket {
@@ -527,7 +635,8 @@ class FastResourceLoader {
         throw std::invalid_argument("Fast resource load ticket is already finished");
       }
       const auto io_started = clock_now();
-      [ticket->command_buffer waitUntilCompleted];
+      wait_io_command_buffer(
+          ticket->command_buffer, 120.0, "Metal IO command buffer");
       const double io_seconds = clock_now() - io_started;
       record_completion(ticket, queue_stats_);
       const uint32_t status = *static_cast<uint32_t*>(ticket->status.contents);
@@ -648,7 +757,10 @@ class FastResourceLoader {
         [encoder endEncoding];
       }
       [command_buffer commit];
-      [command_buffer waitUntilCompleted];
+      {
+        nb::gil_scoped_release release;
+        [command_buffer waitUntilCompleted];
+      }
       const double copy_seconds = clock_now() - copy_started;
       if (command_buffer.status == MTLCommandBufferStatusError) {
         throw std::runtime_error(
@@ -785,6 +897,17 @@ NB_MODULE(_ext, m) {
       "callback"_a);
   m.def("check_async_route_error", &check_async_route_error);
   m.def("eval_with_gil_released", &eval_with_gil_released);
+  m.def(
+      "publish_route_maps",
+      &publish_route_maps,
+      nb::arg("slot_map"),
+      nb::arg("resident"),
+      nb::arg("slots"),
+      nb::arg("mask"));
+  m.def(
+      "synchronize_with_gil_released",
+      &synchronize_with_gil_released,
+      nb::arg("stream").none() = nb::none());
   nb::class_<LoadTicket>(m, "LoadTicket")
       .def_prop_ro("bytes", [](const LoadTicket& ticket) { return ticket.bytes; })
       .def_prop_ro("commands", [](const LoadTicket& ticket) { return ticket.commands; });

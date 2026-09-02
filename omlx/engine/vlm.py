@@ -1683,7 +1683,13 @@ class VLMBatchedEngine(BaseEngine):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
-                    if model_type == QWEN4_EXP_MODEL_TYPE:
+                    # Lazy loading is required for expert streaming on every
+                    # MoE architecture, not only Qwen4-Exp: streaming banks
+                    # are installed before materialization so routed expert
+                    # tensors never become resident.
+                    if model_type == QWEN4_EXP_MODEL_TYPE or getattr(
+                        self._model_settings, "expert_streaming_enabled", False
+                    ):
                         load_kwargs["lazy"] = True
                     loaded = vlm_load(
                         self._model_name,
