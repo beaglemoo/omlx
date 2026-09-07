@@ -1809,6 +1809,7 @@ class Scheduler:
         # For ArraysCache-only models (no RotatingKVCache), use a larger block
         # size to reduce boundary snapshot overhead during prefill.
         self._enlarge_block_size_for_arrays_cache()
+        self._qwen35_sparse_boundaries = self._enable_qwen35_sparse_boundaries()
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
@@ -2776,6 +2777,8 @@ class Scheduler:
     # e.g. a 4096-token block cannot serve a 3k-token prefix. A geometry change
     # also leaves old SSD blocks cold until normal eviction removes them.
     _ARRAYS_CACHE_BLOCK_SIZE = 2048
+    _QWEN35_SPARSE_BOUNDARY_BLOCK_SIZE = 512
+    _QWEN35_SPARSE_BOUNDARY_STRIDE = 2048
 
     def _enlarge_block_size_for_arrays_cache(self) -> None:
         """Enlarge block size for ArraysCache-only hybrid models.
@@ -2851,6 +2854,110 @@ class Scheduler:
             target,
         )
         self.config.paged_cache_block_size = target
+
+    def _enable_qwen35_sparse_boundaries(self) -> bool:
+        """Enable the narrow embedded-GDN sparse-boundary experiment.
+
+        Qwen3.5/3.8 exposes a flat mixture of ArraysCache and KVCache layers.
+        In embedded mode, blocks without an Arrays snapshot carry an explicit
+        placeholder and reconstruction walks back to the newest real state.
+        Composite, rotating, split-GDN, and other cache layouts keep the
+        established every-block capture path.
+        """
+
+        if os.environ.get("OMLX_QWEN35_SPARSE_BOUNDARIES", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False
+        if (
+            self.config.arrays_cache_block_size
+            != self._QWEN35_SPARSE_BOUNDARY_BLOCK_SIZE
+            or self.config.paged_cache_block_size
+            != self._QWEN35_SPARSE_BOUNDARY_BLOCK_SIZE
+            or self.config.gdn_ssd_split_enabled
+            or not self.config.paged_ssd_cache_dir
+        ):
+            logger.info(
+                "Qwen sparse boundaries skipped: requires explicit embedded "
+                "ArraysCache block_size=512 with paged SSD cache"
+            )
+            return False
+
+        model_type = str(getattr(self.model, "model_type", "") or "")
+        if not model_type:
+            model_type = str(
+                getattr(getattr(self.model, "config", None), "model_type", "") or ""
+            )
+        if not model_type.startswith("qwen3_5") or not hasattr(
+            self.model, "make_cache"
+        ):
+            return False
+        try:
+            cache = self.model.make_cache()
+        except Exception:
+            return False
+        names = [type(layer).__name__ for layer in (cache or [])]
+        allowed = {"ArraysCache", "KVCache"}
+        if (
+            not names
+            or any(name not in allowed for name in names)
+            or "ArraysCache" not in names
+            or "KVCache" not in names
+        ):
+            logger.info(
+                "Qwen sparse boundaries skipped: cache layout must be a flat "
+                "ArraysCache/KVCache mixture (got %s)",
+                names,
+            )
+            return False
+
+        logger.info(
+            "Qwen sparse prefill boundaries enabled: block_size=512, "
+            "capture_stride=2048 plus final reachable boundary"
+        )
+        return True
+
+    def _next_prefill_snapshot_boundary(
+        self,
+        current_total: int,
+        final_forwarded_total: int,
+        block_size: int,
+    ) -> int | None:
+        """Return the next boundary that a prefill forward must not cross."""
+
+        if not self._qwen35_sparse_boundaries:
+            return ((current_total // block_size) + 1) * block_size
+
+        final_boundary = (final_forwarded_total // block_size) * block_size
+        candidates = []
+        stride = self._QWEN35_SPARSE_BOUNDARY_STRIDE
+        stride_boundary = ((current_total // stride) + 1) * stride
+        if stride_boundary <= final_forwarded_total:
+            candidates.append(stride_boundary)
+        if current_total < final_boundary <= final_forwarded_total:
+            candidates.append(final_boundary)
+        return min(candidates) if candidates else None
+
+    def _should_capture_prefill_boundary(
+        self,
+        token_count: int,
+        final_forwarded_total: int,
+        block_size: int,
+    ) -> bool:
+        """Return whether this exact materialized position needs a snapshot."""
+
+        if token_count <= 0 or block_size <= 0 or token_count % block_size:
+            return False
+        if not self._qwen35_sparse_boundaries:
+            return True
+        final_boundary = (final_forwarded_total // block_size) * block_size
+        return (
+            token_count % self._QWEN35_SPARSE_BOUNDARY_STRIDE == 0
+            or token_count == final_boundary
+        )
 
     def _model_has_arrays_cache(self) -> bool:
         """Whether the model's cache layout contains ArraysCache layers."""
@@ -3599,6 +3706,7 @@ class Scheduler:
         prefill_tokens = tokens[:-1]
         last_token = tokens[-1:]
         total_length = len(tokens)
+        final_forwarded_total = base_size + len(prefill_tokens)
 
         # Build the input row on the engine stream: the chunk forwards below
         # run inside mx.stream(self._stream), and a worker-default-stream
@@ -3632,11 +3740,15 @@ class Scheduler:
             # Boundary-limited step size
             if boundary_enabled and block_size > 0:
                 current_total = base_size + processed_tokens
-                next_boundary = ((current_total // block_size) + 1) * block_size
-                target_boundary_prefill = next_boundary - base_size
-                delta = target_boundary_prefill - processed_tokens
-                if delta > 0:
-                    n_to_process = min(n_to_process, delta)
+                next_boundary = self._next_prefill_snapshot_boundary(
+                    current_total,
+                    final_forwarded_total,
+                    block_size,
+                )
+                if next_boundary is not None:
+                    delta = next_boundary - current_total
+                    if delta > 0:
+                        n_to_process = min(n_to_process, delta)
                 n_to_process = max(1, n_to_process)
 
             try:
@@ -3764,8 +3876,11 @@ class Scheduler:
             if boundary_enabled:
                 total_tokens = base_size + processed_tokens
                 if (
-                    total_tokens > 0
-                    and total_tokens % block_size == 0
+                    self._should_capture_prefill_boundary(
+                        total_tokens,
+                        final_forwarded_total,
+                        block_size,
+                    )
                     and emitted_boundaries.get(request.request_id, -1) < total_tokens
                 ):
                     self._emit_prefill_boundary_snapshot(
@@ -3905,8 +4020,11 @@ class Scheduler:
         if boundary_enabled:
             total_tokens = base_size + processed_tokens
             if (
-                total_tokens > 0
-                and total_tokens % block_size == 0
+                self._should_capture_prefill_boundary(
+                    total_tokens,
+                    final_forwarded_total,
+                    block_size,
+                )
                 and emitted_boundaries.get(request.request_id, -1) < total_tokens
             ):
                 self._emit_prefill_boundary_snapshot(
@@ -5409,10 +5527,16 @@ class Scheduler:
         # Clamp to the next block boundary so boundary snapshots fire exactly.
         if state.boundary_enabled and state.block_size > 0:
             current_total = state.base_size + state.tokens_processed
-            next_boundary = ((current_total // state.block_size) + 1) * state.block_size
-            delta = (next_boundary - state.base_size) - state.tokens_processed
-            if delta > 0:
-                n = min(n, delta)
+            final_forwarded_total = state.base_size + max(0, state.total_length - 1)
+            next_boundary = self._next_prefill_snapshot_boundary(
+                current_total,
+                final_forwarded_total,
+                state.block_size,
+            )
+            if next_boundary is not None:
+                delta = next_boundary - current_total
+                if delta > 0:
+                    n = min(n, delta)
             n = max(1, n)
 
         # Adaptive throttle — see _adaptive_chunk_size docstring. Raises
@@ -5506,10 +5630,14 @@ class Scheduler:
         # Boundary snapshot
         if state.boundary_enabled:
             total_tokens = state.base_size + state.tokens_processed
+            final_forwarded_total = state.base_size + max(0, state.total_length - 1)
             rid = state.request.request_id
             if (
-                total_tokens > 0
-                and total_tokens % state.block_size == 0
+                self._should_capture_prefill_boundary(
+                    total_tokens,
+                    final_forwarded_total,
+                    state.block_size,
+                )
                 and state.emitted_boundaries.get(rid, -1) < total_tokens
             ):
                 self._emit_prefill_boundary_snapshot(
@@ -5639,10 +5767,14 @@ class Scheduler:
         if not state.boundary_enabled:
             return
         total_tokens = state.base_size + state.tokens_processed
+        final_forwarded_total = state.base_size + max(0, state.total_length - 1)
         rid = state.request.request_id
         if (
-            total_tokens > 0
-            and total_tokens % state.block_size == 0
+            self._should_capture_prefill_boundary(
+                total_tokens,
+                final_forwarded_total,
+                state.block_size,
+            )
             and state.emitted_boundaries.get(rid, -1) < total_tokens
         ):
             self._emit_prefill_boundary_snapshot(
