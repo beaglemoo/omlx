@@ -1569,6 +1569,9 @@ class SchedulerConfig:
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
+    # None/0 selects automatic ArraysCache sizing. An explicit value is only
+    # applied to ArraysCache-only hybrid models and never changes prefill size.
+    arrays_cache_block_size: int | None = None
     max_cache_blocks: int | None = (
         None  # Auto-calculated from available KV cache memory
     )
@@ -2810,6 +2813,28 @@ class Scheduler:
         )
         if not has_arrays_cache:
             return
+
+        explicit = self.config.arrays_cache_block_size
+        if explicit is not None:
+            if (
+                isinstance(explicit, bool)
+                or not isinstance(explicit, int)
+                or explicit < 0
+            ):
+                logger.warning(
+                    "Ignoring invalid arrays_cache_block_size=%r; "
+                    "using automatic sizing",
+                    explicit,
+                )
+            elif explicit > 0:
+                if self.config.paged_cache_block_size != explicit:
+                    logger.info(
+                        "Using configured arrays_cache_block_size=%s for "
+                        "ArraysCache hybrid model",
+                        explicit,
+                    )
+                    self.config.paged_cache_block_size = explicit
+                return
 
         target = max(
             self._ARRAYS_CACHE_BLOCK_SIZE,

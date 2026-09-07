@@ -110,6 +110,7 @@ class TestSchedulerConfig:
         assert config.embedding_batch_size == 32
         assert config.prefill_step_size == 2048
         assert config.paged_cache_block_size == 256
+        assert config.arrays_cache_block_size is None
         assert config.max_cache_blocks is None
         assert config.initial_cache_blocks == 256
         assert config.paged_ssd_cache_dir is None
@@ -3772,6 +3773,26 @@ class TestSchedulerArraysCacheBlockAlignment:
                 return mx.zeros((1, tokens.shape[1], 1))
 
         return HybridModel()
+
+    def test_explicit_arrays_block_override_does_not_change_prefill_step(
+        self, mock_tokenizer, tmp_path
+    ):
+        scheduler = Scheduler(
+            model=self._hybrid_model(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                prefill_step_size=2048,
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_cache_block_size=256,
+                arrays_cache_block_size=512,
+            ),
+        )
+        try:
+            assert scheduler.config.paged_cache_block_size == 512
+            assert scheduler.config.prefill_step_size == 2048
+            assert scheduler._prefill_step_size_for_progress(0, 4096) == 2048
+        finally:
+            scheduler.shutdown()
 
     def test_qwen35_wide_prefill_aligns_block_size_to_4096(
         self, mock_tokenizer, tmp_path
