@@ -14,12 +14,16 @@ Two public tools cover separate questions:
 
 ## Activation and scope
 
-Start an isolated server with both experiment controls set explicitly:
+From this checkout, use a source virtual environment and a separate settings
+base so the experiment does not change the normal server configuration:
 
 ```bash
+PYTHONPATH=. \
 OMLX_QWEN35_SPARSE_BOUNDARIES=1 \
 OMLX_GDN_SNAPSHOT_STORAGE=embedded \
-/path/to/venv/bin/omlx serve \
+/path/to/venv/bin/python -m omlx.cli serve \
+  --base-path /tmp/omlx-sparse-bench \
+  --model-dir /path/to/models \
   --port 8845 \
   --paged-ssd-cache-dir /tmp/omlx-sparse-cache \
   --arrays-cache-block-size 512
