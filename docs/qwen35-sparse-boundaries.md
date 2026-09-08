@@ -170,3 +170,28 @@ PR 3439. Boundary timing follows the instrumentation lineage of PR 3391. The
 experiment measures the final-boundary opportunity discussed in issue 3070;
 these references do not imply that the changes are present in every oMLX
 release.
+
+## Three-sample default-path comparison
+
+A subsequent comparison used the same MLX 0.32.2 source backend in both
+arms, MTP depth 8, temperature zero, non-thinking requests, and three
+measured samples per case after warmup. It compared the automatic 2048-token
+cache blocks with sparse 512-token blocks. These are not measurements against
+the installed app's older bundled MLX runtime.
+
+| Workload | Default median total time | Sparse median total time | Reduction |
+|---|---:|---:|---:|
+| 16K, 400-token code continuation | 16.84 s | 12.76 s | 24.2% |
+| 57K, 400-token code continuation | 29.40 s | 22.08 s | 24.9% |
+| Matched 12-turn synthetic loop, total | 51.07 s | 32.56 s | 36.2% |
+
+All compared prompts matched. Every prompt and output in the 12-turn loop
+matched between arms. Long-form MTP outputs were not byte-identical across
+every run, including default-path repetitions, so these results do not
+establish a universal quality or decode-throughput improvement. The main
+benefit is less cache and prompt-processing work.
+
+The cache-only candidate passed 645 focused tests. Real restored-prefix
+probes used exactly 2048/4096/8192 cached tokens and returned the same facts
+as cache-disabled references. Long-context retrieval and vision probes also
+passed.
