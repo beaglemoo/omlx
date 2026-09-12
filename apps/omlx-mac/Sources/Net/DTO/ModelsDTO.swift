@@ -40,6 +40,14 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// (chat template, config). UI shows it as the inherited value when
     /// `enable_thinking` is unset and offers a one-click reset to it.
     let thinkingDefault: Bool?
+    var thinkingForced: Bool? = nil
+    var reasoningEffortOptions: [String]? = nil
+    var reasoningEffortDefault: String? = nil
+    var reasoningEffortCustom: Bool? = nil
+    var anePrefillBackend: String? = nil
+    var anePrefillDefaultFraction: Double? = nil
+    var anePrefillMlpFractions: [Double]? = nil
+    var anePrefillSharedFractions: [Double]? = nil
     /// True when the model is structurally compatible with DFlash (block
     /// diffusion speculative decoding). The toggle stays disabled when false.
     let dflashCompatible: Bool?
@@ -125,6 +133,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let turboquantKvEnabled: Bool?
     let turboquantKvBits: Double?
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
+    var qwen35AnePrefillSharedFraction: Double? = nil
     let qwen35AnePrefillEnabled: Bool?
     let qwen35AnePrefillSequenceLength: Int?
     let qwen35AnePrefillTailPaddingMinTokens: Int?
@@ -141,6 +150,9 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let qwen35AnePrefillCpuGdnFraction: Double?
     let qwen35AnePrefillCpuThreads: Int?
     let qwen35AnePrefillCpuSharedResource: Bool?
+    // Experimental: oQ mixed-bit INT8-activation prefill kernels
+    let qwen35OqA8Enabled: Bool?
+    let qwen35OqA8MinTokens: Int?
     // Experimental: IndexCache (DSA models only)
     let indexCacheFreq: Int?
     // Experimental: SpecPrefill
@@ -190,7 +202,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var presencePenalty: Double? = nil
     var repetitionPenalty: Double? = nil
     var ttlSeconds: Int? = nil
-    var enableThinking: Bool? = nil
+    var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
     var qwen4PleSsdOffload: Bool? = nil
     // SSD Expert Streaming / Soft-REAP
     var expertStreamingEnabled: Bool? = nil
@@ -220,6 +232,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var turboquantKvEnabled: Bool? = nil
     var turboquantKvBits: Double? = nil
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
+    var qwen35AnePrefillSharedFraction: Double? = nil
     var qwen35AnePrefillEnabled: Bool? = nil
     var qwen35AnePrefillSequenceLength: Int? = nil
     var qwen35AnePrefillTailPaddingMinTokens: Int? = nil
@@ -236,6 +249,9 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var qwen35AnePrefillCpuGdnFraction: Double? = nil
     var qwen35AnePrefillCpuThreads: Int? = nil
     var qwen35AnePrefillCpuSharedResource: Bool? = nil
+    // Experimental: oQ mixed-bit INT8-activation prefill kernels
+    var qwen35OqA8Enabled: Bool? = nil
+    var qwen35OqA8MinTokens: Int? = nil
     // Experimental: IndexCache
     var indexCacheFreq: Int? = nil
     // Experimental: SpecPrefill

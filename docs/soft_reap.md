@@ -101,10 +101,11 @@ cache transitions. Admin benchmark snapshots include these counters.
   the group being computed (`OMLX_SCRATCH_PREFETCH_DEPTH`, default 3). The
   runtime snapshot and the benchmark delta report the scratch path's submit,
   wait, load, gather, compute and scatter seconds.
-- For Qwen4-Exp checkpoints the PLE gather prefaults the rows a prompt
-  touches through the file descriptor on a thread pool before indexing the
-  MADV_RANDOM mapping (`OMLX_QWEN4_PLE_PREFAULT`, default on;
-  `OMLX_QWEN4_PLE_PREFAULT_WORKERS`, default 16). Without it a 1024-token
+- For Qwen4-Exp checkpoints the PLE gather prefetches the pages a prompt
+  touches through the file descriptor on a fixed 48-worker thread pool before
+  indexing the MADV_RANDOM mapping, skipping pages already seen (upstream
+  fc69aeca; the earlier `OMLX_QWEN4_PLE_PREFAULT*` knobs are gone). Without
+  it a 1024-token
   prompt faulted about 16k random rows one at a time while the GPU idled,
   and the same prompt took between 3.6 s and 10 s depending on what the page
   cache still held.
