@@ -512,7 +512,11 @@ class EnginePool:
             if ceiling <= 0:
                 ceiling = self._current_ceiling()
         forced = estimate.force_ssd_offload(ceiling)
-        if forced:
+        streaming = self._expert_streaming_estimate(entry, settings) is not None
+        # Under expert streaming the PLE is always mmapped and the whole-checkpoint
+        # estimate below does not describe what will be resident, so the ceiling
+        # warning would be misleading there.
+        if forced and not streaming:
             logger.warning(
                 "Qwen4-Exp PLE forced to SSD for %s: resident %.1fGB exceeds the "
                 "%.1fGB memory ceiling (mmap needs %.1fGB). Decode will be "
@@ -530,7 +534,7 @@ class EnginePool:
         # ``maybe_apply_pre_load_patches``), and the streaming residency
         # estimate already excludes it. Report that as forced so the pool, the
         # Admin API, and the loader agree on what will actually be resident.
-        if self._expert_streaming_estimate(entry, settings) is not None:
+        if streaming:
             forced = estimate.supported
         return requested or forced, forced, estimate if estimate.supported else None
 
