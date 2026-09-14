@@ -681,6 +681,12 @@
                     this.handleMainTabChange(value);
                 });
 
+                this.$watch('globalSettings.server.host', (value) => {
+                    if (!this.isLoopbackBindHost(value)) {
+                        this.globalSettings.auth.skip_api_key_verification = false;
+                    }
+                });
+
                 // When the user returns to this browser tab after looking
                 // elsewhere, re-check whether a different bench just started
                 // in another tab. Fires the banner without requiring an
@@ -941,6 +947,35 @@
                 }
             },
 
+            isLoopbackBindHost(value) {
+                const hosts = String(value || '')
+                    .split(',')
+                    .map(host => host.trim().toLowerCase())
+                    .filter(Boolean);
+                if (hosts.length === 0) return false;
+                return hosts.every(host => {
+                    if (host.replace(/\.+$/, '') === 'localhost') return true;
+                    if (!host.includes(':')) {
+                        const parts = host.split('.');
+                        return parts.length === 4 && parts[0] === '127'
+                            && parts.every(part => /^(0|[1-9]\d{0,2})$/.test(part)
+                                && Number(part) <= 255);
+                    }
+                    // Normalize IPv6, including expanded and IPv4-mapped forms.
+                    // A scope ID does not change whether an address is loopback.
+                    const [address, scope, extra] = host.split('%');
+                    if (extra !== undefined || scope === '') return false;
+                    if (!/^[0-9a-f:.]+$/.test(address)) return false;
+                    try {
+                        const normalized = new URL(`http://[${address}]/`).hostname;
+                        return normalized === '[::1]'
+                            || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(normalized);
+                    } catch {
+                        return false;
+                    }
+                });
+            },
+
             async saveGlobalSettings() {
                 this.saving = true;
                 this.saveSuccess = false;
@@ -966,6 +1001,15 @@
                     this.saveError = window.t('js.error.required_fields').replace('{fields}', errors.join(', '));
                     this.saving = false;
                     return;
+                }
+
+                if (!this.isLoopbackBindHost(s.server.host)) {
+                    s.auth.skip_api_key_verification = false;
+                    if (!s.auth.api_key && !s.auth.api_key_set) {
+                        this.saveError = window.t('js.error.api_key_required_network');
+                        this.saving = false;
+                        return;
+                    }
                 }
 
                 // Validate API key if provided
@@ -1671,6 +1715,10 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    deepseek_v41_ced_prefill_enabled:
+                        s.deepseek_v41_ced_prefill_enabled === true,
+                    deepseek_v41_ced_prefill_supported:
+                        String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
                     deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
                         || s.deepseek_v41_engram_ssd_offload === true,
                     deepseek_v41_engram_ssd_offload_requested:
@@ -1887,6 +1935,7 @@
                     description: (this.newProfile.description || '').trim() || null,
                     settings: this.formValuesForProfile(),
                     also_save_as_template: false,
+                    expose_as_model: !!this.newProfile.expose_as_model,
                 };
                 try {
                     const r = await fetch(
@@ -2669,6 +2718,8 @@
                                 enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
                                 qwen4_ple_ssd_offload:
                                     !!this.modelSettings.qwen4_ple_ssd_offload,
+                                deepseek_v41_ced_prefill_enabled:
+                                    !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
                                 deepseek_v41_engram_ssd_offload:
                                     this.modelSettings.deepseek_v41_engram_ssd_offload_forced
                                         ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested

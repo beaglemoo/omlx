@@ -252,6 +252,7 @@ class ModelSettingsRequest(BaseModel):
     expert_streaming_native_demand: bool | None = None
     expert_streaming_decode_scratch_as_cache: bool | None = None
     expert_streaming_io_coalescing_kib: int | None = None
+    deepseek_v41_ced_prefill_enabled: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -1423,6 +1424,18 @@ def set_hf_uploader(uploader):
 # =============================================================================
 
 
+def _active_bind_host(global_settings) -> str:
+    """Return the bind address in use until the next server restart."""
+
+    server_state = _get_server_state() if _get_server_state is not None else None
+    active_host = (
+        getattr(server_state, "bind_host", None)
+        if getattr(server_state, "global_settings", None) is global_settings
+        else None
+    )
+    return active_host or global_settings.server.host
+
+
 def format_size(size_bytes: int) -> str:
     """
     Format a byte size as a human-readable string.
@@ -1581,9 +1594,12 @@ async def login_page(request: Request):
 
     global_settings = _get_global_settings()
 
-    # Skip login page when skip_api_key_verification is enabled
+    # Skip login only when no-auth mode is confined to loopback.
     if global_settings is not None and global_settings.auth.skip_api_key_verification:
-        return RedirectResponse(url="/admin/dashboard", status_code=302)
+        from ..utils.network import is_loopback_bind
+
+        if is_loopback_bind(_active_bind_host(global_settings)):
+            return RedirectResponse(url="/admin/dashboard", status_code=302)
 
     api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
@@ -1701,7 +1717,11 @@ async def login(request: LoginRequest, response: Response):
 
 
 @router.post("/api/setup-api-key")
-async def setup_api_key(request: SetupApiKeyRequest, response: Response):
+async def setup_api_key(
+    request: SetupApiKeyRequest,
+    response: Response,
+    http_request: Request,
+):
     """
     Set up the initial API key when none is configured.
 
@@ -1712,6 +1732,7 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
     Args:
         request: SetupApiKeyRequest with api_key and api_key_confirm.
         response: FastAPI response object for setting cookies.
+        http_request: Incoming request used to verify the peer address.
 
     Returns:
         JSON response with success status.
@@ -1723,6 +1744,20 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
     from ..server import _server_state
 
     global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    from ..utils.network import is_loopback_bind, is_loopback_bind_host
+
+    peer_host = getattr(getattr(http_request, "client", None), "host", None)
+    if (
+        not is_loopback_bind(_active_bind_host(global_settings))
+        or not is_loopback_bind_host(peer_host)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Initial API key setup is only available over loopback.",
+        )
 
     # Only allow setup if no API key is currently configured
     if global_settings and global_settings.auth.api_key:
@@ -2361,9 +2396,12 @@ async def _require_admin_or_bearer(request: Request) -> bool:
     """Allow admin session OR a valid Bearer API key (for CLI use)."""
     gs = _get_global_settings() if _get_global_settings else None
 
-    # No-auth mode: always allow
+    # No-auth mode is restricted to loopback-only binds.
     if gs is not None and gs.auth.skip_api_key_verification:
-        return True
+        from ..utils.network import is_loopback_bind
+
+        if is_loopback_bind(_active_bind_host(gs)):
+            return True
 
     # Valid admin session cookie
     if verify_session(request):
@@ -2693,6 +2731,11 @@ async def update_model_settings(
                 status_code=400,
                 detail=f"Invalid SSD expert streaming configuration: {exc}",
             ) from exc
+    if "deepseek_v41_ced_prefill_enabled" in sent:
+        is_v41 = (entry.config_model_type or "").replace("-", "_").lower() == "deepseek_v41"
+        current_settings.deepseek_v41_ced_prefill_enabled = bool(
+            request.deepseek_v41_ced_prefill_enabled and is_v41
+        )
     if "qwen4_ple_ssd_offload" in sent:
         is_qwen4_exp = (entry.config_model_type or "").replace(
             "-", "_"
@@ -4264,6 +4307,60 @@ async def update_global_settings(
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
+    from ..utils.network import (
+        is_loopback_bind,
+        is_valid_bind_host,
+        network_auth_error,
+    )
+
+    candidate_host = (
+        request.host
+        if request.host is not None
+        else getattr(global_settings.server, "host", "127.0.0.1")
+    )
+    host_parts = [host.strip() for host in candidate_host.split(",") if host.strip()]
+    if not host_parts:
+        raise HTTPException(status_code=400, detail="Host cannot be empty")
+    for host in host_parts:
+        if not is_valid_bind_host(host):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid host: {host!r} (must be a hostname or IP address)",
+            )
+
+    if request.api_key is not None:
+        is_valid, error_msg = validate_api_key(request.api_key)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+    candidate_api_key = (
+        request.api_key
+        if request.api_key is not None
+        else global_settings.auth.api_key
+    )
+    candidate_skip_verification = (
+        request.skip_api_key_verification
+        if request.skip_api_key_verification is not None
+        else global_settings.auth.skip_api_key_verification
+    )
+    if auth_error := network_auth_error(
+        candidate_host,
+        candidate_api_key,
+        candidate_skip_verification,
+    ):
+        raise HTTPException(status_code=400, detail=auth_error)
+    if (
+        request.skip_api_key_verification is True
+        and not is_loopback_bind(_active_bind_host(global_settings))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "API key verification cannot be skipped while the running server "
+                "is bound to a non-loopback host. Save a loopback host and restart "
+                "the server first."
+            ),
+        )
+
     # Track which settings were applied at runtime
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
@@ -4271,17 +4368,6 @@ async def update_global_settings(
 
     # Apply server settings
     if request.host is not None:
-        from ..utils.network import is_valid_bind_host
-
-        parts = [h.strip() for h in request.host.split(",") if h.strip()]
-        if not parts:
-            raise HTTPException(status_code=400, detail="Host cannot be empty")
-        for part in parts:
-            if not is_valid_bind_host(part):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid host: {part!r} (must be a hostname or IP address)",
-                )
         global_settings.server.host = request.host
     if request.port is not None:
         global_settings.server.port = request.port
@@ -5118,10 +5204,6 @@ async def update_global_settings(
     if request.api_key is not None:
         from ..server import _server_state
 
-        is_valid, error_msg = validate_api_key(request.api_key)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=error_msg)
-
         global_settings.auth.api_key = request.api_key
         _server_state.api_key = request.api_key
         runtime_applied.append("api_key")
@@ -5804,13 +5886,14 @@ def _build_runtime_cache_observability(
         try:
             num_files = 0
             total_bytes = 0
-            for subdir in "0123456789abcdef":
-                subdir_path = cache_dir / subdir
-                if not subdir_path.exists():
-                    continue
-                for f in subdir_path.glob("*.safetensors"):
-                    num_files += 1
-                    total_bytes += f.stat().st_size
+            for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
+                for subdir in "0123456789abcdef":
+                    subdir_path = root / subdir
+                    if not subdir_path.exists():
+                        continue
+                    for f in subdir_path.glob("*.safetensors"):
+                        num_files += 1
+                        total_bytes += f.stat().st_size
             payload["total_num_files"] = num_files
             payload["total_size_bytes"] = total_bytes
         except Exception as exc:
@@ -6375,16 +6458,17 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
         )
         if cache_dir.exists():
             try:
-                for subdir in "0123456789abcdef":
-                    subdir_path = cache_dir / subdir
-                    if not subdir_path.exists():
-                        continue
-                    for f in subdir_path.glob("*.safetensors"):
-                        try:
-                            f.unlink()
-                            total_deleted += 1
-                        except OSError:
-                            pass
+                for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
+                    for subdir in "0123456789abcdef":
+                        subdir_path = root / subdir
+                        if not subdir_path.exists():
+                            continue
+                        for f in subdir_path.glob("*.safetensors"):
+                            try:
+                                f.unlink()
+                                total_deleted += 1
+                            except OSError:
+                                pass
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 

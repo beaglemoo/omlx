@@ -821,6 +821,24 @@ class TestQwenCpuShareMemoryEstimate:
         assert effective.deepseek_v41_engram_ssd_offload is True
         assert signature["deepseek_v41_engram_ssd_offload"] == "True"
 
+    def test_v41_ced_setting_changes_engine_signature(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        pool = _make_pool(ceiling=500)
+        entry = EngineEntry(
+            model_id="v41", model_path=str(tmp_path), model_type="vlm",
+            engine_type="vlm", config_model_type="deepseek_v41", estimated_size=100,
+        )
+        pool._entries[entry.model_id] = entry
+        settings = ModelSettings()
+        off = pool._engine_runtime_signature("v41", settings)
+        settings.deepseek_v41_ced_prefill_enabled = True
+        on = pool._engine_runtime_signature("v41", settings)
+        assert off != on
+        assert dict(on)["deepseek_v41_ced_prefill_enabled"] == "True"
+        settings.deepseek_v41_ced_prefill_enabled = False
+        assert pool._engine_runtime_signature("v41", settings) == off
+
     @pytest.mark.asyncio
     async def test_v41_live_admission_keeps_viable_mmap_fallback(self, tmp_path):
         """Real pressure may select mmap without making that override sticky."""
@@ -3591,6 +3609,37 @@ class TestMemorySettleBarrier:
         assert pool._current_model_memory == 0
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("concurrent", [False, True])
+    async def test_settle_waits_for_delayed_footprint(
+        self, pool_with_loaded_model, concurrent
+    ):
+        pool = pool_with_loaded_model
+        entry = pool._entries["model-a"]
+        entry.runtime_settle_size = 10 * 1024**3
+        if concurrent:
+            other = MagicMock()
+            other.has_active_requests.return_value = True
+            pool._entries["model-b"].engine = other
+        sleeps = []
+
+        async def record_sleep(duration):
+            sleeps.append(duration)
+
+        with (
+            patch("omlx.engine_pool.mx") as mx,
+            patch("omlx.engine_pool.get_mlx_executor", return_value=None),
+            patch(
+                "omlx.engine_pool.get_phys_footprint",
+                side_effect=[12 * 1024**3, 9 * 1024**3, 1 * 1024**3],
+            ),
+            patch("asyncio.sleep", side_effect=record_sleep),
+        ):
+            mx.get_active_memory.side_effect = [10 * 1024**3, 0, 0]
+            await pool._unload_engine("model-a")
+        assert sleeps.count(0.5) == (0 if concurrent else 1)
+        assert entry.engine is None
+
+    @pytest.mark.asyncio
     async def test_settle_bails_out_under_concurrent_activity(
         self, pool_with_loaded_model, caplog
     ):
@@ -4412,3 +4461,31 @@ def test_qwen4_moe_savings_precede_ple_force_decision(
         _, is_forced, _ = pool._qwen4_ple_offload_status(entry, settings)
         assert is_forced is forced
         assert pool._entry_runtime_resident_size(entry, settings) == expected
+
+
+@pytest.mark.asyncio
+async def test_prepare_cluster_reload_unloads_failed_engine_without_busy_error():
+    """A failed distributed engine must reload cleanly even if busy check would otherwise trigger."""
+    pool = _make_pool()
+    engine = MagicMock()
+    engine.runtime_failed_reason = "rank 1 process died unexpectedly"
+    engine.has_active_requests.return_value = True
+
+    entry = EngineEntry(
+        model_id="test-model",
+        model_path="/fake/path",
+        model_type="llm",
+        engine_type="distributed_batched",
+        estimated_size=1000,
+        engine=engine,
+        in_use=1,
+    )
+    pool._entries["test-model"] = entry
+
+    # Because engine has runtime_failed_reason, prepare_cluster_reload must not raise ModelBusyError
+    unloaded = []
+    pool._unload_engine = AsyncMock(side_effect=lambda mid: unloaded.append(mid))
+
+    await pool.prepare_cluster_reload("test-model")
+    assert unloaded == ["test-model"]
+

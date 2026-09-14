@@ -333,6 +333,10 @@ class ModelSettings:
     expert_streaming_native_demand: bool = True
     expert_streaming_decode_scratch_as_cache: bool = True
     expert_streaming_io_coalescing_kib: int = 64
+    # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
+    # last window-size tokens; decoder global KV is the encoder-final
+    # projection already produced by the midpoint CSA2 layer.
+    deepseek_v41_ced_prefill_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )

@@ -1192,6 +1192,7 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
         return
 
     import safetensors
+    from ..patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import ple_load_resources
 
     original_safe_open = safetensors.safe_open
     is_target_shard = _model_shard_matcher(model_dir)
@@ -1230,7 +1231,8 @@ def _force_qwen4_exp_sanitize_on_load(model_dir: Path):
             model_type,
             model_dir.name,
         )
-        yield
+        with ple_load_resources():
+            yield
     finally:
         safetensors.safe_open = original_safe_open
 
@@ -1490,9 +1492,10 @@ def _count_image_tokens_real(
     processor: Any,
     *,
     upper_bound: int = _IMAGE_TOKEN_UPPER_BOUND_FALLBACK,
+    images: list[Any] | None = None,
 ) -> int:
-    """Sum the *real* per-image token contribution from actual image
-    dimensions, instead of charging every image the model's ``max_pixels``
+    """Sum per-image tokens using processed images when supplied, otherwise
+    source dimensions, instead of charging every image the model's ``max_pixels``
     ceiling. Falls back to ``upper_bound`` per image when the dimensions can't
     be read decode-free or the processor isn't a Qwen-style one, so the guard
     still never under-counts."""
@@ -1510,26 +1513,32 @@ def _count_image_tokens_real(
         and isinstance(getattr(ip, "max_image_tokens", None), int)
     )
 
+    if images is not None:
+        dimensions = [image.size for image in images]
+    else:
+        dimensions = []
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") not in ("image_url", "image", "input_image"):
+                    continue
+                dimensions.append(_read_image_dims(part))
+
     total = 0
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") not in ("image_url", "image", "input_image"):
-                continue
-            wh = _read_image_dims(part) if qwen_ok or glm_ok else None
-            if wh is None:
+    for wh in dimensions:
+        if wh is None or not (qwen_ok or glm_ok):
+            total += upper_bound
+        elif glm_ok:
+            try:
+                total += int(patch_counter(wh[1], wh[0]) // (ms**2))
+            except Exception:
                 total += upper_bound
-            elif glm_ok:
-                try:
-                    total += int(patch_counter(wh[1], wh[0]) // (ms**2))
-                except Exception:
-                    total += upper_bound
-            else:
-                total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
+        else:
+            total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
     return total
 
 
@@ -1839,6 +1848,13 @@ class VLMBatchedEngine(BaseEngine):
                             getattr(
                                 self._model_settings,
                                 "deepseek_v41_engram_ssd_offload",
+                                False,
+                            )
+                        ),
+                        ced_prefill=bool(
+                            getattr(
+                                self._model_settings,
+                                "deepseek_v41_ced_prefill_enabled",
                                 False,
                             )
                         ),
@@ -2163,6 +2179,16 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        if (
+            self._adapter.model_type == "deepseek_v41"
+            and self._adapter.config.ced_prefill
+            and scheduler_config.paged_ssd_cache_dir
+        ):
+            # Approximate decoder states must not become hits in full-prefill
+            # mode (or vice versa) after reloading the model with new settings.
+            scheduler_config.paged_ssd_cache_dir = str(
+                Path(scheduler_config.paged_ssd_cache_dir) / "deepseek_v41_ced_v1"
+            )
 
         engine_config = EngineConfig(
             model_name=self._model_name,
@@ -4218,7 +4244,7 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
-        text_messages, _, _ = extract_images_from_messages(messages)
+        text_messages, images, _ = extract_images_from_messages(messages)
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,
@@ -4241,11 +4267,12 @@ class VLMBatchedEngine(BaseEngine):
                 type(e).__name__,
             )
             return
-        # Count images from the ORIGINAL messages (the stripped
-        # ``text_messages`` no longer has the image content-parts).
+        # Use the decoded dimensions, including resizing and EXIF orientation,
+        # so the memory estimate matches the images passed to the processor.
         image_tokens = _count_image_tokens_real(
             messages,
             getattr(self, "_processor", None),
+            images=images,
             upper_bound=_derive_image_token_upper_bound(
                 getattr(self, "_processor", None)
             ),

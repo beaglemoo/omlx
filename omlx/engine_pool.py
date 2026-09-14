@@ -843,6 +843,10 @@ class EnginePool:
                 entry, settings
             )
             add("deepseek_v41_engram_ssd_offload", v41_offload)
+            add(
+                "deepseek_v41_ced_prefill_enabled",
+                getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
+            )
 
         expert_streaming = bool(data.get("expert_streaming_enabled", False))
         add("expert_streaming_enabled", expert_streaming)
@@ -1361,7 +1365,8 @@ class EnginePool:
             if entry.engine is None:
                 self._clear_load_failure(entry)
                 return
-            self._raise_if_reload_busy(entry, "activate distributed cluster")
+            if not getattr(entry.engine, "runtime_failed_reason", None):
+                self._raise_if_reload_busy(entry, "activate distributed cluster")
             await self._unload_engine(model_id)
             self._clear_load_failure(entry)
 
@@ -2630,6 +2635,7 @@ class EnginePool:
             else resident_size
         )
         pre_unload_active = 0 if distributed else mx.get_active_memory()
+        pre_unload_footprint = 0 if distributed else get_phys_footprint()
 
         try:
             await entry.engine.stop()
@@ -2743,7 +2749,15 @@ class EnginePool:
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
             actual_freed = pre_unload_active - active_now
-            if actual_freed >= min_expected_freed:
+            # Metal can release arrays before macOS updates its footprint
+            # ledger. Admission reads both, so wait for that drop too when
+            # measurable; otherwise an immediate settings reload can fail 507.
+            footprint_pending = (
+                0 < min_expected_freed <= pre_unload_footprint
+                and get_phys_footprint()
+                > pre_unload_footprint - min_expected_freed
+            )
+            if actual_freed >= min_expected_freed and not footprint_pending:
                 settled = True
                 logger.debug(
                     f"Settle round {_settle_round + 1} for '{model_id}': "
@@ -2771,7 +2785,8 @@ class EnginePool:
             logger.debug(
                 f"Settle round {_settle_round + 1} for '{model_id}': "
                 f"freed={format_size(actual_freed)} "
-                f"(need>={format_size(min_expected_freed)}) - retry"
+                f"(need>={format_size(min_expected_freed)}), "
+                f"footprint_pending={footprint_pending} - retry"
             )
             await asyncio.sleep(0.5)
             gc.collect()
