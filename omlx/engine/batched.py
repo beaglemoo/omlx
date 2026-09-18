@@ -6,6 +6,7 @@ This engine wraps AsyncEngineCore to provide continuous batching
 for better throughput when serving multiple concurrent requests.
 """
 
+import asyncio
 import copy
 import logging
 from collections.abc import AsyncIterator
@@ -25,6 +26,7 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
@@ -578,11 +580,9 @@ class BatchedEngine(BaseEngine):
                 from ..patches.qwen35_q4_mlp import (
                     apply_qwen35_q4_lm_prefill_linear_patch,
                     apply_qwen35_q4_mlp_patch,
-                    apply_qwen35_q4_prefill_linear_patch,
                 )
 
                 apply_qwen35_q4_mlp_patch()
-                apply_qwen35_q4_prefill_linear_patch()
                 apply_qwen35_q4_lm_prefill_linear_patch()
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
@@ -888,12 +888,15 @@ class BatchedEngine(BaseEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
-        runtime = getattr(self._model, "_omlx_expert_streaming_runtime", None)
+        runtime = getattr(
+            getattr(self, "_model", None), "_omlx_expert_streaming_runtime", None
+        )
+        cancelled = False
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, "engine") and self._engine.engine is not None:
                 try:
-                    self._engine.engine.close()
+                    cancelled = await _close_engine_core(self._engine.engine)
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
         if runtime is not None:
@@ -913,6 +916,8 @@ class BatchedEngine(BaseEngine):
         )
         self._loaded = False
         logger.info("BatchedEngine stopped")
+        if cancelled:
+            raise asyncio.CancelledError
 
     def _apply_chat_template(
         self,
