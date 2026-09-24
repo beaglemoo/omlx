@@ -41,6 +41,7 @@ import mlx.core as mx
 from . import settings as _settings
 from .engine.base import BaseNonStreamingEngine
 from .utils import psutil_compat
+from .utils.image import clear_image_decode_cache
 from .utils.proc_memory import get_phys_footprint
 
 if TYPE_CHECKING:
@@ -1221,6 +1222,7 @@ class ProcessMemoryEnforcer:
                     # executor without a Scheduler, so an unresolvable
                     # scheduler is their normal shape, not a wrapper break.
                     # Warning here reads as a guard regression (#2312).
+                    engine.set_memory_soft_limit(soft_limit)
                     continue
                 # Silent no-op was the failure mode that originally hid
                 # the dead memory guard: a wrapper-chain change made
@@ -1267,10 +1269,6 @@ class ProcessMemoryEnforcer:
             # the distinction to point at the right knob.
             scheduler._memory_guard_tier = self._memory_guard_tier
             scheduler._prefill_memory_guard = self._prefill_memory_guard
-            # Marks the guard state as trustworthy: until this is set the
-            # sdpa256 route treats _prefill_memory_guard=False as "unknown"
-            # and keeps its memory-safe tiled default (#2283).
-            scheduler._memory_limits_propagated = True
             scheduler._admission_paused = admission_paused
             scheduler._prefill_headroom_safety = self._prefill_headroom_safety
             scheduler._prefill_safe_zone_ratio = self._prefill_safe_zone_ratio
@@ -1469,6 +1467,12 @@ class ProcessMemoryEnforcer:
         current = self._current_usage_bytes()
         soft = int(ceiling * self._soft_threshold)
         hard = int(ceiling * self._hard_threshold)
+        # Reclaim decoded CPU images before pausing admission or evicting
+        # models. Request-owned references may remain, so remeasure usage.
+        if current >= soft:
+            dropped_images = await asyncio.to_thread(clear_image_decode_cache)
+            if dropped_images:
+                current = self._current_usage_bytes()
         prev_level = self._pressure_level
         emergency = self._is_emergency_pressure(current, ceiling)
 

@@ -194,6 +194,7 @@ enum ProfileSettingsKey {
     static let dflashSsdCache = "dflash_ssd_cache"
     static let dflashSsdCacheMaxBytes = "dflash_ssd_cache_max_bytes"
     static let mtpEnabled = "mtp_enabled"
+    static let mtpAdaptiveMaxDepth = "mtp_adaptive_max_depth"
     static let vlmMtpEnabled = "vlm_mtp_enabled"
     static let vlmMtpDraftModel = "vlm_mtp_draft_model"
     static let vlmMtpDraftBlockSize = "vlm_mtp_draft_block_size"
@@ -218,11 +219,7 @@ func resolveActiveProfileDisplay(
     guard let activeName, !activeName.isEmpty else { return nil }
 
     if let profile = modelProfiles.first(where: { $0.name == activeName }),
-       let source = profile.sourceTemplate,
-       let template = templates.first(where: { $0.name == source }) {
-        return (template.templateScope, template.name)
-    }
-    if let template = templates.first(where: { $0.name == activeName }) {
+       let template = profile.matchingTemplate(in: templates) {
         return (template.templateScope, template.name)
     }
     if modelProfiles.contains(where: { $0.name == activeName }) {

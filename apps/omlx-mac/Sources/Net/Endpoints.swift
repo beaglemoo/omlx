@@ -27,6 +27,10 @@ enum AdminAPI {
     static func unloadModel(_ id: String) -> String { "\(models)/\(id)/unload" }
     static func modelSettings(_ id: String) -> String { "\(models)/\(id)/settings" }
     static func expertManifest(_ id: String) -> String { "\(models)/\(id)/expert-manifest" }
+    // Settings snapshots: reset to defaults, omlx.ai benchmark candidates, pasted recipe.
+    static func modelSettingsReset(_ id: String) -> String { "\(modelSettings(id))/reset" }
+    static func modelSettingsOptimal(_ id: String) -> String { "\(modelSettings(id))/optimal" }
+    static func modelSettingsRecipe(_ id: String) -> String { "\(modelSettings(id))/recipe" }
     static let reloadModels    = "\(prefix)/reload"
 
     static func modelProfiles(_ id: String) -> String { "\(models)/\(id)/profiles" }
@@ -35,6 +39,9 @@ enum AdminAPI {
     }
     static func applyModelProfile(_ id: String, _ name: String) -> String {
         "\(models)/\(id)/profiles/\(name)/apply"
+    }
+    static func applyModelTemplate(_ id: String, _ name: String) -> String {
+        "\(models)/\(id)/profile-templates/\(name)/apply"
     }
     static let profileTemplates = "\(prefix)/profile-templates"
     static func profileTemplate(_ name: String) -> String {

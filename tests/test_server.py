@@ -475,7 +475,17 @@ class TestExceptionHandlers:
     @pytest.fixture
     def client(self):
         """Create a test client for the FastAPI app."""
-        return TestClient(app, raise_server_exceptions=False)
+        from omlx.server import _server_state
+
+        original_key = _server_state.api_key
+        original_settings = _server_state.global_settings
+        _server_state.api_key = None
+        _server_state.global_settings = None
+        try:
+            yield TestClient(app, raise_server_exceptions=False)
+        finally:
+            _server_state.api_key = original_key
+            _server_state.global_settings = original_settings
 
     def test_http_exception_logged(self, client, caplog):
         """Test that HTTPException responses are logged."""
@@ -1124,7 +1134,9 @@ def test_responses_reasoning_cache_policy(
         "get_model_settings_for_request",
         lambda name: ModelSettings(cache_reasoning_output=forced),
     )
-    monkeypatch.setitem(srv.app.dependency_overrides, srv.verify_api_key, lambda: True)
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
     with TestClient(srv.app, raise_server_exceptions=False) as client:
         response = client.post(
             "/v1/responses",

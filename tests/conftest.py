@@ -1,4 +1,5 @@
 import os
+import subprocess
 
 # MLX 0.32.2 runs fp32 GPU matmuls at TF32 precision on M5-class tensor units;
 # the fp32 parity tests assert 2e-5, which TF32 cannot hold. Test session only.
@@ -32,6 +33,27 @@ from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
 apply_m5_gather_qmm_workaround()
 
 from omlx.request import Request, SamplingParams
+
+
+@pytest.fixture(autouse=True)
+def cluster_home(tmp_path, monkeypatch):
+    from omlx.cluster import ssh_keys, worker_shim
+
+    home = tmp_path / "cluster-home"
+    publish = worker_shim.ensure_cluster_python_shim
+
+    def publish_shim(**kwargs):
+        if kwargs.get("home") is None:
+            kwargs["home"] = home
+        return publish(**kwargs)
+
+    monkeypatch.setattr(worker_shim, "ensure_cluster_python_shim", publish_shim)
+    # SSH paths are resolved at import time, before test fixtures run.
+    ssh_dir = home / ".ssh"
+    monkeypatch.setattr(ssh_keys, "_SSH_DIR", ssh_dir)
+    monkeypatch.setattr(ssh_keys, "_SSH_KEY_PATH", ssh_dir / "omlx_cluster")
+    monkeypatch.setattr(ssh_keys, "_SSH_PUBKEY_PATH", ssh_dir / "omlx_cluster.pub")
+    return home
 
 
 class MockTokenizer:
@@ -134,6 +156,19 @@ class MockModel:
 def mock_tokenizer() -> MockTokenizer:
     """Provide a mock tokenizer for tests."""
     return MockTokenizer()
+
+
+@pytest.fixture
+def mock_cluster_ssh(monkeypatch):
+    from omlx.cluster import launch
+
+    runner = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            [], 0, stdout='{"action": "no-marker"}', stderr=""
+        )
+    )
+    monkeypatch.setattr(launch, "_run_cluster_ssh", runner)
+    return runner
 
 
 @pytest.fixture

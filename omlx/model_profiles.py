@@ -84,7 +84,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_block_size",
     "dflash_verify_mode",
     "mtp_enabled",
-    "mtp_num_draft_tokens",
+    "mtp_adaptive_max_depth",
+    "mtp_fixed_depth",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
@@ -122,6 +123,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
         "deepseek_v41_engram_ssd_offload",
+        # Architecture-level prefill strategy; explicit per model.
+        "deepseek_v41_ced_prefill_enabled",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
     }
