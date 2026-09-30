@@ -49,6 +49,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
+from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.image import (
@@ -110,6 +111,9 @@ COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
 QWEN4_EXP_MODEL_TYPE = "qwen4_exp"
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
+# mlx-vlm's Gemma4Processor.apply_chat_template renders the messages again. It
+# moves audio markers to the last user turn and prints list system content.
+TOKENIZER_CHAT_TEMPLATE_MODEL_TYPES = {"gemma4", "gemma4_unified", "diffusion_gemma"}
 
 DIFFUSION_PREFILL_STEP_SIZE = 2048
 
@@ -594,6 +598,20 @@ def _resolve_optiq_vision_sidecar(model_dir: Path) -> Path | None:
     return sidecar
 
 
+_AUDIO_WEIGHT_PREFIXES = ("audio_tower.", "embed_audio.", "audio_encoder.")
+
+
+def _is_audio_weight_key(key: str) -> bool:
+    """True for audio encoder weights under MLX or HF naming.
+
+    HF-named checkpoints keep a leading `model.` (`model.audio_tower.*`) that
+    mlx-vlm's sanitize strips only at load time.
+    """
+    if key.startswith("model."):
+        key = key[len("model.") :]
+    return key.startswith(_AUDIO_WEIGHT_PREFIXES)
+
+
 def _has_audio_weights(model_dir: Path) -> bool:
     """Return True iff checkpoint shards or MiMo's sidecar contain audio weights."""
     import safetensors
@@ -610,9 +628,8 @@ def _has_audio_weights(model_dir: Path) -> bool:
         try:
             with safetensors.safe_open(str(sf), framework="np") as f:
                 # safetensors.safe_open exposes keys() but is not a Mapping.
-                for k in f.keys():  # noqa: SIM118
-                    if k.startswith(("audio_tower.", "embed_audio.", "audio_encoder.")):
-                        return True
+                if any(_is_audio_weight_key(k) for k in f.keys()):  # noqa: SIM118
+                    return True
         except Exception:
             # Corrupt or unreadable shard — treat as no audio info, let
             # downstream loader produce its own error.
@@ -1447,6 +1464,7 @@ _QWEN_VISION_MODELS = {
     "prism_hadamard_qwen35",  # Ternary Bonsai 2 keeps the Qwen3.5 vision tower.
     "qwen3_vl",
     "qwen3_vl_moe",
+    "qwen4_exp",  # Reuses the Qwen3.5/Qwen3-VL vision tower verbatim.
     "qwen2_vl",
     "qwen2_5_vl",
     "mimo_v2",
@@ -1455,6 +1473,23 @@ _QWEN_VISION_MODELS = {
 
 # Grid-based VLMs whose flat vision features can be split with grid_thw.
 _GRID_VISION_MODELS = _QWEN_VISION_MODELS | {"glm5_next"}
+
+# Model types eligible for the processor-free cached-input path (see
+# ``VLMBatchedEngine._try_build_cached_vision_inputs``). mimo variants are
+# excluded: their audio-aware pipeline owns input assembly.
+_CACHED_INPUT_FAST_PREPARE_MODEL_TYPES = _QWEN_VISION_MODELS - {
+    "mimo_v2",
+    "mimo_v2_flash",
+}
+
+
+def _grid_row(image_grid_thw: Any, i: int) -> Optional[List[int]]:
+    """Row ``i`` of an ``image_grid_thw`` tensor as ``[t, h, w]``, or None."""
+    try:
+        row = [int(v) for v in image_grid_thw[i]]
+    except (IndexError, TypeError, ValueError):
+        return None
+    return row if len(row) == 3 else None
 
 
 def _grid_image_token_starts(
@@ -1691,6 +1726,85 @@ def _count_image_tokens_real(
         else:
             total += _smart_resize_tokens(wh[1], wh[0], ps, ms, minp, maxp)
     return total
+
+
+def _audio_feature_cache_key_ranges(
+    token_ids: list[int],
+    input_features: Any,
+    input_features_mask: Any,
+    audio_token_id: int | None,
+    image_ranges: list[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """Extend image cache boundaries with cumulative audio-clip identities.
+
+    Audio placeholder tokens only encode clip length, so without this two
+    different clips of equal length share prefix-cache blocks. Each clip is
+    hashed without its batch padding (clips are padded to the longest one in
+    the request), so a clip keeps its key when a later turn adds a longer one.
+    """
+    import hashlib
+
+    import numpy as np
+
+    def _to_np(value):
+        if isinstance(value, mx.array):
+            if value.dtype == mx.bfloat16:
+                value = value.astype(mx.float32)
+            return np.array(value)
+        return np.asarray(value)
+
+    features = _to_np(input_features)
+    mask = None if input_features_mask is None else _to_np(input_features_mask)
+
+    runs = []
+    position = 0
+    while audio_token_id is not None and position < len(token_ids):
+        if token_ids[position] != audio_token_id:
+            position += 1
+            continue
+        runs.append(position)
+        while position < len(token_ids) and token_ids[position] == audio_token_id:
+            position += 1
+
+    audio_hash = hashlib.sha256()
+    audio_events = []
+    if features.ndim >= 2 and len(runs) == features.shape[0]:
+        for i, start in enumerate(runs):
+            clip = features[i]
+            if mask is not None and mask.shape[:2] == features.shape[:2]:
+                valid = int(mask[i].sum())
+                # Trim only right padding; any other mask layout keeps the
+                # padded row, which can over-key but never collide.
+                if mask[i][:valid].all():
+                    clip = clip[:valid]
+            audio_hash.update(str(clip.shape).encode())
+            audio_hash.update(np.ascontiguousarray(clip).tobytes())
+            audio_events.append((start, audio_hash.hexdigest()))
+    else:
+        # Clips can't be matched to token runs: key everything from the
+        # first audio token on (or the whole request) on all audio input.
+        audio_hash.update(str(features.shape).encode())
+        audio_hash.update(np.ascontiguousarray(features).tobytes())
+        audio_events.append((runs[0] if runs else 0, audio_hash.hexdigest()))
+
+    events = [(start, key, None) for start, key in image_ranges]
+    events += [(start, None, key) for start, key in audio_events]
+    ranges = []
+    image_key = ""
+    audio_key = None
+    for start, image_update, audio_update in sorted(events, key=lambda e: e[0]):
+        if image_update is not None:
+            image_key = image_update
+        if audio_update is not None:
+            audio_key = audio_update
+        key = image_key
+        if audio_key is not None:
+            key = hashlib.sha256(f"audio:{image_key}:{audio_key}".encode()).hexdigest()
+        if ranges and ranges[-1][0] == start:
+            ranges[-1] = (start, key)
+        else:
+            ranges.append((start, key))
+    return ranges
 
 
 class VLMBatchedEngine(BaseEngine):
@@ -1954,6 +2068,7 @@ class VLMBatchedEngine(BaseEngine):
             _patch_video_processor_bug()
             _patch_torch_free_image_processor()
             apply_pixtral_torch_free_patch()
+            apply_gemma4_audio_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _strip_vision_config_if_orphaned(Path(self._model_name)),
@@ -2273,17 +2388,143 @@ class VLMBatchedEngine(BaseEngine):
             )
         ):
             try:
-                from ..patches.qwen35_moe_gate_up import (
-                    apply_qwen35_moe_gate_up_fusion,
-                )
+                from ..patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
 
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    apply_qwen35_moe_gate_up_fusion,
+                    apply_moe_gate_up_fusion,
                     self._vlm_model,
                 )
             except Exception:
                 logger.debug("MoE gate+up fusion not applied", exc_info=True)
+
+        # Qwen ANE prefill compiles its slices from the stock QuantizedLinear
+        # layout, so build them before the packed projections replace it. The
+        # class hooks are installed later, outside the other Qwen class patches.
+        ane_count = 0
+        requested_ane_sequence_length = 2048
+        if (
+            getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+            and ane_prefill_backend(self.model_type) == "qwen"
+        ):
+            ane_fraction = ane_prefill_fraction(
+                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
+            )
+            try:
+                from ..patches.qwen35_ane_prefill import enable_qwen35_ane_prefill
+
+                requested_ane_sequence_length = int(
+                    getattr(
+                        self._model_settings,
+                        "qwen35_ane_prefill_sequence_length",
+                        2048,
+                    )
+                )
+
+                def _enable_ane_prefill():
+                    return enable_qwen35_ane_prefill(
+                        self._vlm_model,
+                        sequence_length=requested_ane_sequence_length,
+                        tail_padding_min_tokens=int(
+                            getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_tail_padding_min_tokens",
+                                0,
+                            )
+                            or 0
+                        ),
+                        fraction=ane_fraction,
+                        max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_max_layers",
+                            64,
+                        ),
+                        gdn=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn",
+                            True,
+                        ),
+                        gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_fraction",
+                            0.50,
+                        ),
+                        gdn_max_layers=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_gdn_max_layers",
+                            48,
+                        ),
+                        dual_ane=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_dual_ane",
+                            True,
+                        ),
+                        ane_down_fraction=(
+                            ane_fraction
+                            if getattr(
+                                self._model_settings,
+                                "qwen35_ane_prefill_fused_down",
+                                False,
+                            )
+                            else 0.0
+                        ),
+                        fused_down=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_fused_down",
+                            False,
+                        ),
+                        cpu_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_fraction",
+                            0.135,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_down_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_down_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_gdn_fraction=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_gdn_fraction",
+                            0.0,
+                        )
+                        if getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_enabled",
+                            False,
+                        )
+                        else 0.0,
+                        cpu_threads=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_threads",
+                            8,
+                        ),
+                        cpu_shared_resource=getattr(
+                            self._model_settings,
+                            "qwen35_ane_prefill_cpu_shared_resource",
+                            True,
+                        ),
+                        install_dispatch=False,
+                    )
+
+                ane_count = await loop.run_in_executor(
+                    get_mlx_executor(),
+                    _enable_ane_prefill,
+                )
+            except Exception:
+                logger.warning("Qwen ANE prefill not enabled", exc_info=True)
 
         # Dense Qwen3.5-family 4-bit projections -> tile-repacked layout for
         # the M5 tensor units. Replaces the layers in place, so resident
@@ -2321,7 +2562,9 @@ class VLMBatchedEngine(BaseEngine):
                 )
             self._vision_cache = VisionFeatureSSDCache(
                 cache_dir=vision_ssd_dir,
-                max_memory_entries=20,
+                # Agent sessions resend 20-90 screenshots; bound by bytes.
+                max_memory_entries=4096,
+                max_memory_bytes=1024**3,
             )
             logger.info(
                 "Vision feature cache enabled (SSD: %s)",
@@ -2530,6 +2773,17 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.debug("Qwen MoE router patch not applied", exc_info=True)
 
+        # One-token routed experts: gate+up/SwiGLU and down/weighted-sum in
+        # two launches instead of five (bit-identical; needs the router patch).
+        try:
+            from ..patches.qwen35_moe_routed_decode import (
+                apply_qwen35_moe_routed_decode_patch,
+            )
+
+            apply_qwen35_moe_routed_decode_patch()
+        except Exception:
+            logger.debug("Qwen MoE routed decode patch not applied", exc_info=True)
+
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
@@ -2549,142 +2803,21 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("oQ A8 prefill patch not applied", exc_info=True)
 
-        if (
-            getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
-            and ane_prefill_backend(self.model_type) == "qwen"
-        ):
-            ane_fraction = ane_prefill_fraction(
-                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
-            )
+        if ane_count or getattr(self._vlm_model, "_omlx_ane_gdn_prefill_count", 0):
             try:
                 from ..patches.qwen35_ane_prefill import (
+                    ane_prefill_transient_bytes,
                     configure_qwen35_ane_prefill_scheduler,
-                    enable_qwen35_ane_prefill,
+                    install_qwen35_ane_prefill_dispatch,
                 )
 
-                requested_ane_sequence_length = int(
-                    getattr(
-                        self._model_settings,
-                        "qwen35_ane_prefill_sequence_length",
-                        2048,
-                    )
-                )
-
-                def _enable_ane_prefill():
-                    return enable_qwen35_ane_prefill(
-                        self._vlm_model,
-                        sequence_length=requested_ane_sequence_length,
-                        tail_padding_min_tokens=int(
-                            getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_tail_padding_min_tokens",
-                                0,
-                            )
-                            or 0
-                        ),
-                        fraction=ane_fraction,
-                        max_layers=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_max_layers",
-                            64,
-                        ),
-                        gdn=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn",
-                            True,
-                        ),
-                        gdn_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn_fraction",
-                            0.50,
-                        ),
-                        gdn_max_layers=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_gdn_max_layers",
-                            48,
-                        ),
-                        dual_ane=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_dual_ane",
-                            True,
-                        ),
-                        ane_down_fraction=(
-                            ane_fraction
-                            if getattr(
-                                self._model_settings,
-                                "qwen35_ane_prefill_fused_down",
-                                False,
-                            )
-                            else 0.0
-                        ),
-                        fused_down=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_fused_down",
-                            False,
-                        ),
-                        cpu_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_fraction",
-                            0.135,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_down_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_down_fraction",
-                            0.0,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_gdn_fraction=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_gdn_fraction",
-                            0.0,
-                        )
-                        if getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
-                            False,
-                        )
-                        else 0.0,
-                        cpu_threads=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_threads",
-                            8,
-                        ),
-                        cpu_shared_resource=getattr(
-                            self._model_settings,
-                            "qwen35_ane_prefill_cpu_shared_resource",
-                            True,
-                        ),
-                    )
-
-                ane_count = await loop.run_in_executor(
-                    get_mlx_executor(),
-                    _enable_ane_prefill,
-                )
-                if ane_count or getattr(
-                    self._vlm_model, "_omlx_ane_gdn_prefill_count", 0
-                ):
+                if install_qwen35_ane_prefill_dispatch():
                     configure_qwen35_ane_prefill_scheduler(
                         scheduler,
                         requested_ane_sequence_length,
                     )
-                    # The scheduler snapshotted model info before these
-                    # banks existed; price the compiled I/O surfaces now so
+                    # Price the compiled I/O surfaces off the full model so
                     # admission charges them while the banks are resident.
-                    from ..patches.qwen35_ane_prefill import (
-                        ane_prefill_transient_bytes,
-                    )
-
                     monitor = getattr(scheduler, "memory_monitor", None)
                     if monitor is not None:
                         monitor.set_ane_prefill_transient_bytes(
@@ -2887,7 +3020,9 @@ class VLMBatchedEngine(BaseEngine):
         # Drop wrapper-side references before EngineCore.close() performs its
         # final worker-thread MLX reclaim. Otherwise the VLM wrapper can keep
         # model weights or cached feature arrays alive until after the reclaim
-        # pass has already run.
+        # pass has already run. Mark unloaded first: the scheduler is no longer
+        # reachable once _engine is cleared.
+        self._loaded = False
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -2912,7 +3047,6 @@ class VLMBatchedEngine(BaseEngine):
                     logger.warning(f"Error closing engine: {e}")
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
-        self._loaded = False
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError
@@ -3000,6 +3134,14 @@ class VLMBatchedEngine(BaseEngine):
         tokenizer.tool_parser = tool_module.parse_tool_call
 
         logger.info(f"VLM tool calling enabled: parser={tool_parser_type}")
+
+    def _chat_template_target(self, model_type: str) -> Any:
+        """Return the object that renders messages already formatted by oMLX."""
+        if model_type in TOKENIZER_CHAT_TEMPLATE_MODEL_TYPES or not hasattr(
+            self._processor, "apply_chat_template"
+        ):
+            return getattr(self._processor, "tokenizer", self._processor)
+        return self._processor
 
     @staticmethod
     def _count_content_parts(content: Any, part_types: set[str]) -> int:
@@ -3377,6 +3519,246 @@ class VLMBatchedEngine(BaseEngine):
         # Unsupported model: skip caching
         return None
 
+    def _encode_missing_vision_features(
+        self,
+        pixel_values: Any,
+        extra_model_inputs: dict,
+        cached_per_image: List[Any],
+        per_hashes: List[str],
+        image_token_count: Optional[int],
+    ) -> Optional[mx.array]:
+        """Encode only uncached images and combine with cached ones in order.
+
+        Qwen-style towers attend within each image, so a subset encodes
+        independently. Returns None when the request cannot be split safely.
+        """
+        model = self._vlm_model
+        model_type = self.model_type or ""
+        grid_thw = extra_model_inputs.get("image_grid_thw")
+        if (
+            model_type not in _QWEN_VISION_MODELS
+            or hasattr(model, "encode_image")
+            or grid_thw is None
+            or pixel_values is None
+            or not hasattr(pixel_values, "shape")
+            or pixel_values.ndim != 2
+        ):
+            return None
+
+        num_images = len(cached_per_image)
+        miss_idx = [i for i, f in enumerate(cached_per_image) if f is None]
+        if not miss_idx or len(miss_idx) == num_images:
+            return None
+
+        grids = [_grid_row(grid_thw, i) for i in range(num_images)]
+        if any(g is None for g in grids):
+            return None
+
+        rows = [t * h * w for t, h, w in grids]
+        if sum(rows) != pixel_values.shape[0]:
+            return None
+
+        vision_tower = getattr(model, "vision_tower", None)
+        merge_sq = getattr(vision_tower, "spatial_merge_size", 2) ** 2
+        # A token count mismatch means a different resize regime.
+        for f, (t, h, w) in zip(cached_per_image, grids):
+            if f is not None and f.shape[0] != (t * h * w) // merge_sq:
+                return None
+
+        try:
+            offsets = [0]
+            for r in rows:
+                offsets.append(offsets[-1] + r)
+            pv_miss = mx.concatenate(
+                [pixel_values[offsets[i] : offsets[i + 1]] for i in miss_idx],
+                axis=0,
+            )
+            grid_miss = mx.array([grids[i] for i in miss_idx])
+            miss_inputs = dict(extra_model_inputs)
+            miss_inputs["image_grid_thw"] = grid_miss
+            features_miss = self._compute_vision_features(pv_miss, miss_inputs)
+            if features_miss is None:
+                return None
+            mx.eval(features_miss)
+            split_miss = self._split_vision_features(
+                features_miss, len(miss_idx), miss_inputs
+            )
+            if split_miss is None or len(split_miss) != len(miss_idx):
+                return None
+
+            full = list(cached_per_image)
+            for i, f in zip(miss_idx, split_miss):
+                full[i] = f
+                self._vision_cache.put(
+                    per_hashes[i], self._model_name, f, grid=grids[i]
+                )
+            combined = mx.concatenate(full, axis=0)
+            if not self._vision_features_match_image_tokens(
+                combined, image_token_count
+            ):
+                return None
+            logger.debug(
+                "Vision feature cache partial hit: encoded %d of %d images",
+                len(miss_idx),
+                num_images,
+            )
+            return combined
+        except Exception:
+            logger.debug(
+                "Partial vision encoding failed, recomputing all images",
+                exc_info=True,
+            )
+            return None
+
+    def _try_build_cached_vision_inputs(
+        self,
+        prompt: str,
+        images: List[Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Build ``prepare_inputs``-style inputs, preprocessing only cache misses.
+
+        Splits the prompt on the vision marker, tokenizes the text chunks, and
+        expands each marker from the cached or fresh patch grid. Adds
+        ``cached_image_features``. Returns None to use the full path.
+        """
+        model_type = self.model_type or ""
+        if (
+            model_type not in _CACHED_INPUT_FAST_PREPARE_MODEL_TYPES
+            or self._vision_cache is None
+            or not self._vision_cache_enabled
+            or not images
+            or not isinstance(prompt, str)
+            or hasattr(self._vlm_model, "encode_image")
+        ):
+            return None
+        try:
+            processor = self._processor
+            tokenizer = getattr(processor, "tokenizer", None)
+            image_processor = getattr(processor, "image_processor", None)
+            config = self._vlm_model.config
+            vs_id = getattr(config, "vision_start_token_id", None)
+            ve_id = getattr(config, "vision_end_token_id", None)
+            it_id = getattr(config, "image_token_id", None)
+            if (
+                tokenizer is None
+                or image_processor is None
+                or vs_id is None
+                or ve_id is None
+                or it_id is None
+            ):
+                return None
+            merge_sq = int(getattr(image_processor, "merge_size", 2)) ** 2
+            vs_tok = tokenizer.convert_ids_to_tokens(vs_id)
+            it_tok = tokenizer.convert_ids_to_tokens(it_id)
+            ve_tok = tokenizer.convert_ids_to_tokens(ve_id)
+            if not all(isinstance(t, str) for t in (vs_tok, it_tok, ve_tok)):
+                return None
+            marker = vs_tok + it_tok + ve_tok
+            # Manual expansion is only equivalent to the processor when every
+            # placeholder in the prompt is the canonical marker triple.
+            if prompt.count(marker) != len(images):
+                return None
+
+            per_hashes = compute_per_image_hashes(images)
+            feats: List[Optional[mx.array]] = []
+            grids: List[Optional[List[int]]] = []
+            for h in per_hashes:
+                feat = self._vision_cache.get(h, self._model_name)
+                grid = self._vision_cache.get_grid(h, self._model_name)
+                # A row count mismatch means a different resize regime.
+                if (
+                    feat is not None
+                    and grid is not None
+                    and (grid[0] * grid[1] * grid[2]) % merge_sq == 0
+                    and feat.shape[0] == (grid[0] * grid[1] * grid[2]) // merge_sq
+                ):
+                    feats.append(feat)
+                    grids.append(grid)
+                else:
+                    feats.append(None)
+                    grids.append(None)
+            miss_idx = [i for i, f in enumerate(feats) if f is None]
+            if len(miss_idx) == len(images):
+                return None  # Nothing cached; the full path costs the same.
+
+            if miss_idx:
+                # Marker-only prompt; the real text is tokenized below.
+                from mlx_vlm.utils import prepare_inputs
+
+                miss_images = [images[i] for i in miss_idx]
+                miss_inputs = prepare_inputs(
+                    processor,
+                    images=miss_images,
+                    prompts=[marker * len(miss_idx)],
+                )
+                miss_pv = miss_inputs.get("pixel_values")
+                miss_grid = miss_inputs.get("image_grid_thw")
+                if miss_pv is None or miss_grid is None:
+                    return None
+                miss_grids = [
+                    _grid_row(miss_grid, k) for k in range(len(miss_idx))
+                ]
+                if any(g is None for g in miss_grids):
+                    return None
+                miss_kw = {"image_grid_thw": mx.array(miss_grids)}
+                features_miss = self._compute_vision_features(miss_pv, miss_kw)
+                if features_miss is None:
+                    return None
+                mx.eval(features_miss)
+                split_miss = self._split_vision_features(
+                    features_miss, len(miss_idx), miss_kw
+                )
+                if split_miss is None or len(split_miss) != len(miss_idx):
+                    return None
+                for k, i in enumerate(miss_idx):
+                    feats[i] = split_miss[k]
+                    grids[i] = miss_grids[k]
+                    self._vision_cache.put(
+                        per_hashes[i],
+                        self._model_name,
+                        split_miss[k],
+                        grid=miss_grids[k],
+                    )
+
+            token_ids: List[int] = []
+            chunks = prompt.split(marker)
+            for k, chunk in enumerate(chunks):
+                if chunk:
+                    enc = tokenizer(chunk, add_special_tokens=False)
+                    token_ids.extend(enc["input_ids"])
+                if k < len(chunks) - 1:
+                    t, h, w = grids[k]
+                    token_ids.append(vs_id)
+                    token_ids.extend([it_id] * ((t * h * w) // merge_sq))
+                    token_ids.append(ve_id)
+
+            combined = mx.concatenate(feats, axis=0)
+            pad_total = sum(1 for t in token_ids if t == it_id)
+            if pad_total != combined.shape[0]:
+                return None
+
+            pixel_values = (
+                miss_pv if miss_idx else mx.zeros((0, 1), dtype=mx.float32)
+            )
+            return {
+                "input_ids": mx.array([token_ids]),
+                "attention_mask": mx.ones((1, len(token_ids)), dtype=mx.int32),
+                # Non-None empty tensor keeps the model's multimodal branch
+                # taken; with cached_image_features the tower skips it anyway.
+                "pixel_values": pixel_values,
+                "image_grid_thw": mx.array(grids),
+                "mm_token_type_ids": mx.array(
+                    [[1 if t == it_id else 0 for t in token_ids]]
+                ),
+                "cached_image_features": combined,
+            }
+        except Exception:
+            logger.debug(
+                "Cached-input fast path failed; falling back to full preprocessing",
+                exc_info=True,
+            )
+            return None
+
     def _split_vision_features(
         self,
         features: mx.array,
@@ -3714,10 +4096,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs.update(chat_template_kwargs)
         _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
-        # Use processor or its tokenizer for chat template application
-        template_target = self._processor
-        if not hasattr(template_target, "apply_chat_template"):
-            template_target = getattr(self._processor, "tokenizer", self._processor)
+        template_target = self._chat_template_target(model_type)
         try:
             prompt = apply_chat_template_with_reasoning_effort_fallback(
                 template_target,
@@ -3764,13 +4143,22 @@ class VLMBatchedEngine(BaseEngine):
                 **template_kwargs,
             )
 
-        # Tokenize text and preprocess images and audio
-        inputs = prepare_inputs(
-            self._processor,
-            images=images if images else None,
-            audio=audio if audio else None,
-            prompts=[prompt] if isinstance(prompt, str) else prompt,
-        )
+        # Images with cached features and grids skip the image processor.
+        fast_cached_features = None
+        inputs = None
+        if num_audios == 0:
+            fast = self._try_build_cached_vision_inputs(prompt, images)
+            if fast is not None:
+                fast_cached_features = fast.pop("cached_image_features", None)
+                inputs = fast
+        if inputs is None:
+            # Tokenize text and preprocess images and audio
+            inputs = prepare_inputs(
+                self._processor,
+                images=images if images else None,
+                audio=audio if audio else None,
+                prompts=[prompt] if isinstance(prompt, str) else prompt,
+            )
 
         input_ids = inputs["input_ids"]
         pixel_values = inputs.get("pixel_values")
@@ -3904,6 +4292,8 @@ class VLMBatchedEngine(BaseEngine):
             # Build call kwargs from extra_model_inputs (includes input_features
             # for audio, image_grid_thw, etc.)
             call_kwargs = dict(extra_model_inputs)
+            if fast_cached_features is not None:
+                call_kwargs["cached_image_features"] = fast_cached_features
 
             # Image-specific: compute hash and try vision feature cache
             image_hash = None
@@ -3916,6 +4306,8 @@ class VLMBatchedEngine(BaseEngine):
                 num_images > 0
                 and self._vision_cache is not None
                 and self._vision_cache_enabled
+                # Fast path already assembled the combined features.
+                and fast_cached_features is None
             ):
                 per_hashes = compute_per_image_hashes(images)
                 cached_per_image = [
@@ -3969,6 +4361,20 @@ class VLMBatchedEngine(BaseEngine):
                         )
 
                 if not used_cached_features:
+                    # Partial hit: encode only the uncached images when the
+                    # vision tower supports per-image slicing.
+                    partial = self._encode_missing_vision_features(
+                        pixel_values,
+                        extra_model_inputs,
+                        cached_per_image,
+                        per_hashes,
+                        image_token_count,
+                    )
+                    if partial is not None:
+                        call_kwargs["cached_image_features"] = partial
+                        used_cached_features = True
+
+                if not used_cached_features:
                     # Some or all uncached — compute all, then cache per-image
                     try:
                         features = self._compute_vision_features(
@@ -3987,8 +4393,14 @@ class VLMBatchedEngine(BaseEngine):
                                 features, num_images, extra_model_inputs
                             )
                             if per_features is not None:
-                                for h, f in zip(per_hashes, per_features):
-                                    self._vision_cache.put(h, self._model_name, f)
+                                grid_thw = extra_model_inputs.get("image_grid_thw")
+                                for j, (h, f) in enumerate(
+                                    zip(per_hashes, per_features)
+                                ):
+                                    grid = _grid_row(grid_thw, j)
+                                    self._vision_cache.put(
+                                        h, self._model_name, f, grid=grid
+                                    )
                                 logger.debug(
                                     "Vision feature cache miss, stored %d per-image entries",
                                     len(per_features),
@@ -4070,6 +4482,23 @@ class VLMBatchedEngine(BaseEngine):
                     token_ids,
                     extra_model_inputs["audio_codes"],
                     self._vlm_model.config.audio_token_id,
+                    image_ranges,
+                )
+                image_cache_key_start = image_cache_key_ranges[0][0]
+                image_hash = image_cache_key_ranges[-1][1]
+            elif has_audio and "input_features" in extra_model_inputs:
+                image_ranges = image_cache_key_ranges
+                if image_hash is not None and not image_ranges:
+                    image_ranges = [(0, image_hash)]
+                config = self._vlm_model.config
+                audio_token_id = getattr(config, "audio_token_id", None)
+                if audio_token_id is None:
+                    audio_token_id = getattr(config, "audio_token_index", None)
+                image_cache_key_ranges = _audio_feature_cache_key_ranges(
+                    token_ids,
+                    extra_model_inputs["input_features"],
+                    extra_model_inputs.get("input_features_mask"),
+                    audio_token_id,
                     image_ranges,
                 )
                 image_cache_key_start = image_cache_key_ranges[0][0]
@@ -5039,9 +5468,7 @@ class VLMBatchedEngine(BaseEngine):
             template_kwargs.update(chat_template_kwargs)
         _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
-        template_target = self._processor
-        if not hasattr(template_target, "apply_chat_template"):
-            template_target = getattr(self._processor, "tokenizer", self._processor)
+        template_target = self._chat_template_target(model_type)
         try:
             return template_target.apply_chat_template(
                 formatted_messages, **template_kwargs

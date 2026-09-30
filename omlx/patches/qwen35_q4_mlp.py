@@ -21,6 +21,8 @@ from mlx_lm.models.activations import swiglu
 
 from omlx.custom_kernels.nax import is_nax_available
 
+from .qwen35_packed_linear import PackedLinear
+
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
@@ -76,18 +78,23 @@ def register_qwen35_prefill_linear_backend(
     _PREFILL_LINEAR_BACKEND = backend
 
 
+def _try_backend(linear: Any, x: mx.array) -> mx.array | None:
+    backend = _PREFILL_LINEAR_BACKEND
+    if backend is None:
+        return None
+    try:
+        return backend(linear, x)
+    except Exception:
+        # A backend fault must cost throughput, never a request.
+        logger.debug("prefill linear backend failed; falling back", exc_info=True)
+        return None
+
+
 def _backend_or_qmm(linear: Any, x: mx.array, variant: int) -> mx.array:
     """First refusal to the registered backend, then the W4A16 NAX kernel."""
-    backend = _PREFILL_LINEAR_BACKEND
-    if backend is not None:
-        try:
-            routed = backend(linear, x)
-        except Exception:
-            # A backend fault must cost throughput, never a request.
-            logger.debug("prefill linear backend failed; falling back", exc_info=True)
-            routed = None
-        if routed is not None:
-            return routed
+    routed = _try_backend(linear, x)
+    if routed is not None:
+        return routed
     return _linear_qmm(linear, x, variant)
 
 
@@ -463,6 +470,16 @@ class _VLMQuantizedPrefillLinear(nn.QuantizedLinear):
         return super().__call__(x)
 
 
+class _VLMPackedPrefillLinear(PackedLinear):
+    # Same floor as the stock projections; the packed kernels serve the rest.
+    def __call__(self, x):
+        if x.ndim == 3 and x.shape[-2] >= _VLMQuantizedPrefillLinear._route_min_tokens:
+            routed = _try_backend(self, x)
+            if routed is not None:
+                return routed
+        return super().__call__(x)
+
+
 def apply_qwen35_q4_prefill_linear_patch(model) -> bool:
     """Route the loaded Qwen projections without replacing their forward graph."""
     if os.environ.get("OMLX_QWEN35_Q4_LINEAR", "1") == "0" or not _has_native_qmm():
@@ -501,6 +518,9 @@ def apply_qwen35_q4_prefill_linear_patch(model) -> bool:
             linear = getattr(module, name, None)
             if type(linear) is nn.QuantizedLinear:
                 linear.__class__ = _VLMQuantizedPrefillLinear
+                installed = True
+            elif type(linear) is PackedLinear:
+                linear.__class__ = _VLMPackedPrefillLinear
                 installed = True
     return installed
 
@@ -634,9 +654,11 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
         orig_gdn = gdn_cls.__call__
         try:
             gdn_module = importlib.import_module(gdn_cls.__module__)
-            gated_delta_update = gdn_module.gated_delta_update
         except Exception:
-            gated_delta_update = getattr(module, "gated_delta_update", None)
+            gdn_module = module
+        gated_delta_update = getattr(gdn_module, "gated_delta_update", None)
+        # Must match the stock body, which decode and short chunks still use.
+        normalize_qk = getattr(gdn_module, "normalize_qk", None)
 
         def patched_gdn(self, inputs, mask=None, cache=None, n_confirmed: int = 0):
             # n_confirmed is the Native-MTP draft/verify split (patches/mlx_lm_mtp).
@@ -645,6 +667,7 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
             # __call__ only when set, so stock GatedDeltaNet stays compatible.
             if (
                 gated_delta_update is None
+                or normalize_qk is None
                 or inputs.ndim != 3
                 or inputs.shape[-2] < min_tokens
                 or self.sharding_group is not None
@@ -718,9 +741,7 @@ def apply_qwen35_q4_lm_prefill_linear_patch() -> bool:
             ]
 
             state = cache[1] if cache else None
-            inv_scale = k.shape[-1] ** -0.5
-            q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-            k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+            q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
 
             out, state = gated_delta_update(
                 q,

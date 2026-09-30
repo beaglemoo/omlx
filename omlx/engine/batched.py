@@ -45,6 +45,19 @@ except ImportError:
     preprocess_harmony_messages = None  # type: ignore
 
 
+def _mtp_sidecar_load_kwargs(model_name: str) -> dict[str, Any]:
+    """Loader kwargs for a MiMo MTP sidecar next to the checkpoint.
+
+    MLX conversions of MiMo V2 drop the next-token-prediction layers; the
+    upstream ``model_mtp.safetensors`` under ``<model>/mtp/`` restores
+    Lightning MTP decoding (same rule as ``load_text_model``).
+    """
+    from ..utils.model_loading import mimo_mtp_sidecar_config
+
+    sidecar_config = mimo_mtp_sidecar_config(model_name)
+    return {"model_config": sidecar_config} if sidecar_config else {}
+
+
 class BatchedEngine(BaseEngine):
     """
     Batched engine for continuous batching.
@@ -312,6 +325,7 @@ class BatchedEngine(BaseEngine):
                 self._model_name,
                 tokenizer_config=tokenizer_config,
                 trust_remote_code=self._trust_remote_code,
+                **_mtp_sidecar_load_kwargs(self._model_name),
                 # With expert offload (or expert streaming) the load stays
                 # lazy so the wraps below can drop non-resident expert tensors
                 # BEFORE anything materializes them; materialize_lazy_state
@@ -359,6 +373,9 @@ class BatchedEngine(BaseEngine):
                     0.25,
                 )
             )
+            # Lightning MTP: the draft head's experts stay resident while the
+            # backbone streams, matching the VLM engine and what admission
+            # prices (run_in_executor takes no kwargs, so bind with partial).
             moe_offload_wrapped = await loop.run_in_executor(
                 get_mlx_executor(),
                 functools.partial(
@@ -502,13 +519,11 @@ class BatchedEngine(BaseEngine):
             )
         ):
             try:
-                from ..patches.qwen35_moe_gate_up import (
-                    apply_qwen35_moe_gate_up_fusion,
-                )
+                from ..patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
 
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    apply_qwen35_moe_gate_up_fusion,
+                    apply_moe_gate_up_fusion,
                     self._model,
                 )
             except Exception:
