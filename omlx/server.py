@@ -197,6 +197,7 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     ModelUnavailableError,
+    PeerBusyError,
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
     SchedulerQueueFullError,
@@ -922,7 +923,12 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
         )
     else:
         content = {"detail": exc.detail}
-    return JSONResponse(status_code=exc.status_code, content=content)
+    # Preserve headers set on the exception (for example Retry-After on 503).
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=content,
+        headers=getattr(exc, "headers", None),
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -1329,6 +1335,15 @@ def _wake_process_memory_enforcer(*, active: bool = False) -> None:
         wake(active=active)
 
 
+def _peer_busy_http_exception(error: PeerBusyError) -> HTTPException:
+    """503 with Retry-After: a peer engine holds the memory and is busy."""
+    return HTTPException(
+        status_code=503,
+        detail=str(error),
+        headers={"Retry-After": str(error.retry_after_s)},
+    )
+
+
 async def get_engine(
     model_id: str | None = None,
     engine_type: EngineType = EngineType.LLM,
@@ -1447,6 +1462,8 @@ async def get_engine(
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e))
+    except PeerBusyError as e:
+        raise _peer_busy_http_exception(e) from e
     except ModelUnavailableError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except ModelLoadingError as e:
@@ -3540,6 +3557,8 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
         raise HTTPException(status_code=507, detail=str(e)) from e
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e)) from e
+    except PeerBusyError as e:
+        raise _peer_busy_http_exception(e) from e
     except ModelUnavailableError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except ModelLoadingError as e:

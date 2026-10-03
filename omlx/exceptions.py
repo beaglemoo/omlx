@@ -545,6 +545,27 @@ class InsufficientMemoryError(EnginePoolError):
         super().__init__(message)
 
 
+class PeerBusyError(EnginePoolError):
+    """Raised when a load needs memory held by a peer engine that is busy.
+
+    The peer (for example the DwarfStar launcher) is mid-reply, still
+    starting, or was started too recently to evict. Callers map this to
+    HTTP 503 with ``Retry-After`` instead of 507, since retrying shortly
+    can succeed.
+    """
+
+    retry_after_s = 15
+
+    def __init__(self, model_id: str, peer: str, reason: str):
+        self.model_id = model_id
+        self.peer = peer
+        self.reason = reason
+        super().__init__(
+            f"Cannot load {model_id}: peer engine {peer} holds the memory and "
+            f"is busy ({reason}). Retry in {self.retry_after_s}s."
+        )
+
+
 class ModelLoadingError(EnginePoolError):
     """Raised when a model load is unavailable, blocked, or invalid."""
 

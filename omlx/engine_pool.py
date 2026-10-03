@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from .cluster.registry import ClusterRegistry
     from .model_settings import ModelSettingsManager
 
+import httpx
 import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
@@ -49,6 +50,7 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
     ModelUnavailableError,
+    PeerBusyError,
     describe_ceiling_binding,
 )
 from .model_discovery import (
@@ -214,6 +216,18 @@ def _qwen35_cpu_share_estimated_bytes(
 _ADMISSION_CEILING_RECHECKS = 4
 _ADMISSION_CEILING_RECHECK_S = 0.25
 
+# Peer engine eviction (OMLX_PEER_EVICT_URLS). A peer is another local engine
+# helper that shares unified memory with oMLX and exposes GET /admin/status and
+# POST /admin/stop?if_idle=1 (the DwarfStar launcher).
+_PEER_STATUS_TIMEOUT_S = 2.0
+_PEER_STOP_TIMEOUT_S = 15.0
+# A peer that has been loaded for less time than this is treated as busy so two
+# engines cannot evict each other in a loop.
+_PEER_MIN_UPTIME_S = 20.0
+_PEER_UNLOAD_POLL_S = 0.5
+# Recheck budget after a peer was evicted: 20 x 0.25s = 5s.
+_PEER_EVICT_RECHECKS = 20
+
 
 def _settled_phys_footprint() -> int:
     """phys_footprint minus freed Metal buffers the kernel still charges."""
@@ -366,6 +380,13 @@ class EnginePool:
         self._settings_manager: object | None = None  # Set by server
         self._cluster_registry: ClusterRegistry | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
+        # Peer engines to evict when the free-memory ceiling blocks a load.
+        self._peer_evict_urls: list[str] = [
+            u.strip().rstrip("/")
+            for u in os.environ.get("OMLX_PEER_EVICT_URLS", "").split(",")
+            if u.strip()
+        ]
+        self._peer_evict_transport: httpx.AsyncBaseTransport | None = None
         # Requests whose prefill already got a pooled-buffer reclaim pass.
         # Prefill continuously refills MLX's buffer cache, so the reclaim
         # rung can "succeed" marginally on every pass of a long prompt while
@@ -987,6 +1008,91 @@ class EnginePool:
         except Exception:  # noqa: BLE001
             return False
         return 0 < dynamic < min(others, default=dynamic + 1)
+
+    async def _evict_peers(self) -> tuple[str, str, str]:
+        """Ask each configured peer engine to release its memory.
+
+        Returns ``(outcome, peer_url, reason)`` where outcome is:
+
+        - ``"none"``: no peer holds memory (not loaded, unreachable, or the
+          stop failed in a way retrying cannot fix).
+        - ``"busy"``: a peer is mid-reply, starting, recently started, refused
+          the idle-only stop, or did not unload in time.
+        - ``"evicted"``: at least one peer unloaded and none were busy.
+        """
+        evicted: list[str] = []
+        for url in self._peer_evict_urls:
+            try:
+                async with httpx.AsyncClient(
+                    transport=self._peer_evict_transport,
+                    timeout=_PEER_STATUS_TIMEOUT_S,
+                ) as client:
+                    result, reason = await self._evict_one_peer(client, url)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Peer eviction of %s failed: %s", url, exc)
+                continue
+            if result == "busy":
+                logger.warning("Peer %s is busy (%s); not evicting", url, reason)
+                return "busy", url, reason
+            if result == "evicted":
+                evicted.append(url)
+        if evicted:
+            return "evicted", ",".join(evicted), ""
+        return "none", "", ""
+
+    async def _evict_one_peer(
+        self, client: httpx.AsyncClient, url: str
+    ) -> tuple[str, str]:
+        try:
+            resp = await client.get(
+                f"{url}/admin/status", timeout=_PEER_STATUS_TIMEOUT_S
+            )
+            resp.raise_for_status()
+            status = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.info("Peer %s status unavailable (%s); skipping", url, exc)
+            return "none", ""
+        if not isinstance(status, dict):
+            return "none", ""
+        if status.get("starting"):
+            return "busy", "starting"
+        if not status.get("loaded"):
+            return "none", ""
+        if int(status.get("in_flight") or 0) > 0:
+            return "busy", "in_flight"
+        uptime = status.get("uptime_seconds")
+        if isinstance(uptime, (int, float)) and uptime < _PEER_MIN_UPTIME_S:
+            return "busy", f"started {uptime:.0f}s ago"
+
+        logger.warning("Stopping idle peer engine %s to free memory", url)
+        try:
+            resp = await client.post(
+                f"{url}/admin/stop",
+                params={"if_idle": "1"},
+                timeout=_PEER_STOP_TIMEOUT_S,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("Peer %s stop request failed: %s", url, exc)
+            return "none", ""
+        if resp.status_code == 409:
+            return "busy", "stop refused (not idle)"
+        if resp.status_code >= 400:
+            logger.warning("Peer %s stop returned HTTP %d", url, resp.status_code)
+            return "none", ""
+
+        deadline = time.monotonic() + _PEER_STOP_TIMEOUT_S
+        while True:
+            try:
+                resp = await client.get(
+                    f"{url}/admin/status", timeout=_PEER_STATUS_TIMEOUT_S
+                )
+                if not resp.json().get("loaded"):
+                    return "evicted", ""
+            except (httpx.HTTPError, ValueError, AttributeError):
+                pass
+            if time.monotonic() >= deadline:
+                return "busy", "still unloading"
+            await asyncio.sleep(_PEER_UNLOAD_POLL_S)
 
     def _ceiling_binding_and_advice(
         self, *, ceiling: int, current: int, tail: str
@@ -2329,6 +2435,9 @@ class EnginePool:
                 evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
                 evicted_any = unloaded_for_admission
                 ceiling_rechecks = 0
+                max_rechecks = _ADMISSION_CEILING_RECHECKS
+                peer_evicted = False
+                peer_evict_tried = False
                 while True:
                     # Consult the tracked accumulator alongside live memory:
                     # after a model settles or idles, mx.get_active_memory() and
@@ -2421,8 +2530,24 @@ class EnginePool:
                         break
 
                     if (
-                        ceiling_rechecks < _ADMISSION_CEILING_RECHECKS
+                        self._peer_evict_urls
+                        and not peer_evict_tried
                         and self._dynamic_ceiling_binds()
+                    ):
+                        # Local eviction is exhausted and the free-memory
+                        # ceiling binds: another engine helper (DwarfStar)
+                        # is likely holding the memory. Stop it only if idle.
+                        peer_evict_tried = True
+                        outcome, peer, reason = await self._evict_peers()
+                        if outcome == "busy":
+                            raise PeerBusyError(model_id, peer, reason)
+                        if outcome == "evicted":
+                            peer_evicted = True
+                            ceiling_rechecks = 0
+                            max_rechecks = _PEER_EVICT_RECHECKS
+
+                    if ceiling_rechecks < max_rechecks and (
+                        peer_evicted or self._dynamic_ceiling_binds()
                     ):
                         # Pages of a model unloaded just before this load
                         # reach the free list up to ~0.2s after the process
