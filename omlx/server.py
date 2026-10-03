@@ -3518,8 +3518,9 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
 
 
 # How long POST /v1/models/{id}/unload waits for an aborted model to drain
-# before answering 202 "unloading" instead of 200 "ok".
-_UNLOAD_DRAIN_WAIT_S = 30.0
+# before answering 202 "unloading" instead of 200 "ok". Kept under the
+# DwarfStar launcher's 30s client timeout for this call.
+_UNLOAD_DRAIN_WAIT_S = 20.0
 
 
 @app.post("/v1/models/{model_id}/unload")
