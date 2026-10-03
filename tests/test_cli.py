@@ -1278,6 +1278,7 @@ class TestServeCommandFunctions:
             events.append("run")
             captured["socket_name"] = sockets[0].getsockname()
             captured["socket_count"] = len(sockets)
+            captured["graceful"] = self.config.timeout_graceful_shutdown
 
         monkeypatch.setattr("uvicorn.Config.bind_socket", tracking_bind_socket)
         monkeypatch.setattr("uvicorn.Server.run", fake_run)
@@ -1287,6 +1288,7 @@ class TestServeCommandFunctions:
         fake_server.init_server.assert_called_once()
         assert events == ["bind", "init", "run"]
         assert captured["socket_count"] == 1
+        assert captured["graceful"] == 90
         assert captured["socket_name"][0] == host
         assert captured["socket_name"][1] > 0
 

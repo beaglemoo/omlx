@@ -21,6 +21,10 @@ import sys
 
 from ._version import __version__
 
+# Seconds uvicorn waits for in-flight requests (streams) to finish on SIGTERM
+# before cancelling them; lets a launchd stop drain instead of cutting streams.
+GRACEFUL_SHUTDOWN_TIMEOUT_S = 90
+
 
 def _positive_float(value: str) -> float:
     try:
@@ -315,6 +319,7 @@ def serve_command(args):
         port=settings.server.port,
         log_level=uvicorn_level,
         access_log=show_access_log,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT_S,
     )
     # Bind a socket per host so an occupied port fails fast before model preload.
     # uvicorn.Server.run(sockets=[...]) accepts a list and listens on all of them.
