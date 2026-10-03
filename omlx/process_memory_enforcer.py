@@ -462,6 +462,10 @@ class ProcessMemoryEnforcer:
         # prefill chunk / step boundary. See the grace check in
         # _check_and_enforce.
         self._pressure_reclaim_grace_polls: int = 0
+        # True once "hard pressure but no models loaded" was logged at
+        # warning for the current state; later polls in the same state log at
+        # debug. Cleared when the pressure level changes or a model loads.
+        self._no_models_pressure_logged: bool = False
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -1641,6 +1645,7 @@ class ProcessMemoryEnforcer:
             self._pressure_reclaim_grace_polls = 0
 
         if new_level != prev_level:
+            self._no_models_pressure_logged = False
             self._pressure_level = new_level
             self._propagate_memory_limit()
             logger.info(
@@ -1830,6 +1835,7 @@ class ProcessMemoryEnforcer:
                             for e in self._engine_pool._entries.values()
                         )
                         if has_loaded:
+                            self._no_models_pressure_logged = False
                             if emergency:
                                 emergency_current = self._current_usage_bytes()
                             else:
@@ -1872,7 +1878,18 @@ class ProcessMemoryEnforcer:
                                 requested,
                             )
                         else:
-                            logger.warning("Hard memory pressure but no models loaded.")
+                            # Persistent hard pressure with nothing loaded
+                            # (for example another process holding memory)
+                            # repeats every poll: warn once per state change.
+                            if not self._no_models_pressure_logged:
+                                self._no_models_pressure_logged = True
+                                logger.warning(
+                                    "Hard memory pressure but no models loaded."
+                                )
+                            else:
+                                logger.debug(
+                                    "Hard memory pressure but no models loaded."
+                                )
                 # soft + all pinned: nothing to do beyond admission pause.
                 break
 

@@ -1554,6 +1554,48 @@ class TestSingleModelMemoryPressure:
         assert entry.engine is None
 
     @pytest.mark.asyncio
+    async def test_no_models_loaded_warning_logged_once_per_state(
+        self, enforcer, caplog
+    ):
+        """Persistent hard pressure with nothing loaded must not spam warnings."""
+        enforcer._engine_pool._entries = {}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+        text = "Hard memory pressure but no models loaded."
+
+        async def poll():
+            with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+                mock_mx.get_active_memory.side_effect = _cycling([15 * 1024**3])
+                await enforcer._check_and_enforce()
+
+        def warnings():
+            return [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and text in r.getMessage()
+            ]
+
+        with caplog.at_level("DEBUG", logger="omlx.process_memory_enforcer"):
+            await poll()
+            await poll()
+            await poll()
+            assert len(warnings()) == 1
+            assert (
+                sum(
+                    1
+                    for r in caplog.records
+                    if r.levelname == "DEBUG" and text in r.getMessage()
+                )
+                == 2
+            )
+
+            # A state change (pressure recovers, then returns) warns again.
+            with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+                mock_mx.get_active_memory.side_effect = _cycling([1 * 1024**3])
+                await enforcer._check_and_enforce()
+            await poll()
+            assert len(warnings()) == 2
+
+    @pytest.mark.asyncio
     async def test_single_busy_model_aborts_and_keeps_model_at_hard_pressure(
         self, enforcer
     ):
