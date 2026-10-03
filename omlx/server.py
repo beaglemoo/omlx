@@ -3517,6 +3517,11 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     return status
 
 
+# How long POST /v1/models/{id}/unload waits for an aborted model to drain
+# before answering 202 "unloading" instead of 200 "ok".
+_UNLOAD_DRAIN_WAIT_S = 30.0
+
+
 @app.post("/v1/models/{model_id}/unload")
 async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     """Manually unload a model from memory."""
@@ -3529,7 +3534,37 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
-    await _server_state.engine_pool._unload_engine(model_id)
+    pool = _server_state.engine_pool
+    try:
+        # Graceful: abort in-flight requests, then tear down only once the
+        # scheduler has drained, never mid-step. New leases are rejected while
+        # the unload is pending.
+        unloaded = await pool.request_unload(model_id, reason="manual admin unload")
+    except ModelLoadingError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ModelBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+    if not unloaded:
+        # Callers expect the model gone when this returns; give the drain a
+        # bounded window before reporting it as still pending.
+        deadline = time.monotonic() + _UNLOAD_DRAIN_WAIT_S
+        while time.monotonic() < deadline:
+            current = pool.get_entry(model_id)
+            if current is None or current.engine is None:
+                unloaded = True
+                break
+            await asyncio.sleep(0.1)
+
+    if not unloaded:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "unloading",
+                "model_id": model_id,
+                "message": f"Aborting active requests before unloading {model_id}",
+            },
+        )
     return {"status": "ok", "model_id": model_id}
 
 
