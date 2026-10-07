@@ -119,7 +119,6 @@ class BatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
-            text_only=True,
         )
 
     @property
@@ -360,10 +359,15 @@ class BatchedEngine(BaseEngine):
         # materializing. Runs on the MLX executor because it allocates the
         # resident slot tensors (#1304).
         moe_offload_wrapped = 0
+        offload_stats = offload_release = offload_restore = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
+                moe_offload_caches,
+                moe_offload_stats,
+                release_moe_offload_slots,
+                restore_moe_offload_slots,
             )
 
             fraction = float(
@@ -397,6 +401,10 @@ class BatchedEngine(BaseEngine):
                 await loop.run_in_executor(
                     get_mlx_executor(), materialize_offload_state, self._model
                 )
+                caches = moe_offload_caches(self._model)
+                offload_stats = functools.partial(moe_offload_stats, caches=caches)
+                offload_release = functools.partial(release_moe_offload_slots, caches)
+                offload_restore = functools.partial(restore_moe_offload_slots, caches)
 
         if getattr(self._model_settings, "expert_streaming_enabled", False):
             from ..expert_streaming import install_expert_streaming
@@ -794,6 +802,7 @@ class BatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
+        scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
         signature = getattr(self._model, "_omlx_k2_ane_signature", None)
         if signature:
             scheduler_config.model_name = (
@@ -817,6 +826,9 @@ class BatchedEngine(BaseEngine):
 
         # TurboQuant KV cache: propagate bits to scheduler
         scheduler = self._engine.engine.scheduler
+        scheduler.moe_offload_stats = offload_stats
+        scheduler.moe_offload_release = offload_release
+        scheduler.moe_offload_restore = offload_restore
         if ane_prefill_sequence_length:
             from ..patches.qwen35_ane_prefill import (
                 configure_qwen35_ane_prefill_scheduler,
@@ -1054,6 +1066,46 @@ class BatchedEngine(BaseEngine):
         Returns:
             Number of prompt tokens
         """
+        return len(
+            self._encode_chat_prompt(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=is_partial,
+            )
+        )
+
+    async def tokenize_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
+        add_special_tokens: bool | None = None,
+    ) -> list[int]:
+        if not self._loaded:
+            await self.start()
+        return self._encode_chat_prompt(
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+            add_generation_prompt=add_generation_prompt,
+            add_special_tokens=add_special_tokens,
+        )
+
+    def _encode_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+        add_generation_prompt: bool | None = None,
+        add_special_tokens: bool | None = None,
+    ) -> list[int]:
+        # Same rendering as chat(); the scheduler encodes the prompt with the
+        # tokenizer defaults.
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
@@ -1061,8 +1113,13 @@ class BatchedEngine(BaseEngine):
             template_tools,
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
+            add_generation_prompt=add_generation_prompt,
         )
-        return len(self._tokenizer.encode(prompt))
+        if add_special_tokens is None:
+            return list(self._tokenizer.encode(prompt))
+        return list(
+            self._tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+        )
 
     @staticmethod
     def _pop_specprefill_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
