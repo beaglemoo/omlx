@@ -2212,6 +2212,29 @@ class EnginePool:
             )
             return False
 
+    async def unload_if_idle(self, model_id: str) -> bool:
+        """Unload now only when nothing is using the model.
+
+        Never aborts and never installs a pending-unload marker: a busy model
+        keeps serving its streams and keeps accepting new requests. Returns
+        True when the model is not resident any more (unloaded here or
+        already gone) and False when leases, requests or scheduler work are
+        still active. Callers poll this to wait for a drain.
+        """
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            if entry is None or entry.engine is None:
+                return True
+            if entry.is_loading:
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' is still loading and cannot be unloaded yet",
+                )
+            if not self._entry_is_quiescent(entry):
+                return False
+            await self._unload_engine(model_id)
+            return True
+
     def is_abort_requested(self, model_id: str | None) -> bool:
         if model_id is None:
             return False

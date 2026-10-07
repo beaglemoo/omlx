@@ -3578,15 +3578,27 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     return status
 
 
-# How long POST /v1/models/{id}/unload waits for an aborted model to drain
-# before answering 202 "unloading" instead of 200 "ok". Kept under the
-# DwarfStar launcher's 30s client timeout for this call.
+# How long POST /v1/models/{id}/unload waits for a busy model to go idle
+# before refusing with 409 model_busy (default) or, with ?force=1, before
+# answering 202 "unloading" for an aborted model. Callers must use a client
+# timeout longer than this to see the 409 instead of a read timeout.
 _UNLOAD_DRAIN_WAIT_S = 20.0
 
 
 @app.post("/v1/models/{model_id}/unload")
-async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
-    """Manually unload a model from memory."""
+async def unload_model(
+    model_id: str,
+    force: bool = False,
+    _: bool = Depends(verify_api_key),
+):
+    """Unload a model from memory.
+
+    Default: refuse while the model is serving. Waits up to
+    ``_UNLOAD_DRAIN_WAIT_S`` for in-flight and queued work to finish, then
+    unloads (200) or answers 409 ``model_busy`` and leaves the model and its
+    streams untouched. ``?force=1`` aborts active requests, drains and unloads
+    (200, or 202 if the drain outlasts the window).
+    """
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
@@ -3597,8 +3609,19 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
     pool = _server_state.engine_pool
+    if not force:
+        deadline = time.monotonic() + _UNLOAD_DRAIN_WAIT_S
+        try:
+            while not await pool.unload_if_idle(model_id):
+                if time.monotonic() >= deadline:
+                    return _model_busy_response(model_id)
+                await asyncio.sleep(0.1)
+        except (ModelLoadingError, ModelBusyError) as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        return {"status": "ok", "model_id": model_id}
+
     try:
-        # Graceful: abort in-flight requests, then tear down only once the
+        # Forced: abort in-flight requests, then tear down only once the
         # scheduler has drained, never mid-step. New leases are rejected while
         # the unload is pending.
         unloaded = await pool.request_unload(model_id, reason="manual admin unload")
@@ -3628,6 +3651,25 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
             },
         )
     return {"status": "ok", "model_id": model_id}
+
+
+def _model_busy_response(model_id: str) -> JSONResponse:
+    message = (
+        f"Model '{model_id}' is busy serving requests; it was not unloaded. "
+        "Retry when it is idle, or pass ?force=1 to abort active requests."
+    )
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "message": message,
+                "type": "model_busy",
+                "code": "model_busy",
+                "model_id": model_id,
+            }
+        },
+        headers={"Retry-After": "15"},
+    )
 
 
 @app.post("/v1/models/{model_id}/load")
