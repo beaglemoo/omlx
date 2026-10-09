@@ -95,7 +95,8 @@ async def test_lease_rejected_during_manual_unload_uses_unload_error(reason):
 
 
 @pytest.mark.asyncio
-async def test_public_unload_of_active_model_aborts_requests_first():
+async def test_public_force_unload_of_active_model_aborts_requests_first(monkeypatch):
+    monkeypatch.setattr(server, "_UNLOAD_DRAIN_WAIT_S", 0.05)
     entry = MagicMock()
     entry.engine = object()
     entry.is_loading = False
@@ -104,7 +105,7 @@ async def test_public_unload_of_active_model_aborts_requests_first():
     pool.request_unload = AsyncMock(return_value=False)
 
     with patch.object(server._server_state, "engine_pool", pool):
-        response = await server.unload_model("model-a", _=True)
+        response = await server.unload_model("model-a", force=True, _=True)
 
     assert response.status_code == 202
     assert json.loads(response.body) == {
@@ -114,6 +115,26 @@ async def test_public_unload_of_active_model_aborts_requests_first():
     }
     pool.request_unload.assert_awaited_once_with("model-a", reason="manual unload")
     pool._unload_engine.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_public_unload_without_force_does_not_abort(monkeypatch):
+    monkeypatch.setattr(server, "_UNLOAD_DRAIN_WAIT_S", 0.05)
+    entry = MagicMock()
+    entry.engine = object()
+    entry.is_loading = False
+    pool = MagicMock()
+    pool.get_entry.return_value = entry
+    pool.unload_if_idle = AsyncMock(return_value=False)
+    pool.request_unload = AsyncMock()
+
+    with patch.object(server._server_state, "engine_pool", pool):
+        response = await server.unload_model("model-a", _=True)
+
+    assert response.status_code == 409
+    assert response.headers["Retry-After"] == "15"
+    assert json.loads(response.body)["error"]["type"] == "model_busy"
+    pool.request_unload.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -148,6 +169,24 @@ def test_unload_abort_of_scheduled_request_returns_409():
 
     assert response.status_code == 409
     assert response.json()["error"]["message"] == UNLOAD_ABORT_MESSAGE
+
+
+def test_unload_abort_409_is_not_model_busy():
+    """Studio treats only type=model_busy as busy; an aborted request is not."""
+    app = FastAPI()
+    app.add_exception_handler(RequestAbortedError, server.request_aborted_handler)
+
+    @app.post("/v1/chat/completions")
+    async def chat():
+        raise _unload_abort_error()
+
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions")
+
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["type"] != "model_busy"
 
 
 @pytest.mark.asyncio

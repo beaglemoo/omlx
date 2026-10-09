@@ -16,6 +16,7 @@ from omlx.exceptions import ModelBusyError, ModelLoadingError
 def _pool(*, loaded=True, request_unload=True, unload_if_idle=True):
     entry = MagicMock()
     entry.engine = object() if loaded else None
+    entry.is_loading = False
     pool = MagicMock()
     pool.get_entry.return_value = entry
     pool.request_unload = AsyncMock(return_value=request_unload)
@@ -105,7 +106,7 @@ async def test_unknown_and_unloaded_models_keep_status_codes():
 async def test_force_idle_model_unloads_through_request_unload():
     pool, _ = _pool(request_unload=True)
     assert await _call(pool, force=True) == {"status": "ok", "model_id": "m"}
-    pool.request_unload.assert_awaited_once_with("m", reason="manual admin unload")
+    pool.request_unload.assert_awaited_once_with("m", reason="manual unload")
     pool.unload_if_idle.assert_not_awaited()
 
 
