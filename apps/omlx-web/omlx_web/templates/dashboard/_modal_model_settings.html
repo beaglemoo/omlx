@@ -825,10 +825,11 @@
                             <div class="flex items-start justify-between gap-3">
                                 <div class="min-w-0">
                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.expert_streaming') }}</span>
-                                    <span class="ml-1 text-[10px] font-bold uppercase tracking-wider text-amber-600">{{ t('modal.model_settings.experimental_label') }}</span>
+                                    <span class="ml-1 text-caption font-bold uppercase tracking-wider text-amber-600">{{ t('modal.model_settings.experimental_label') }}</span>
                                     <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.expert_streaming_hint') }}</p>
                                 </div>
-                                <button type="button"
+                                <button type="button" role="switch"
+                                        :aria-checked="modelSettings.expert_streaming_enabled ? 'true' : 'false'"
                                         @click="modelSettings.expert_streaming_enabled = !modelSettings.expert_streaming_enabled"
                                         :class="modelSettings.expert_streaming_enabled ? 'bg-black' : 'bg-neutral-200'"
                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -884,7 +885,8 @@
                                         <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_fast_resource_loading') }}</span>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('modal.model_settings.expert_fast_resource_loading_hint') }}</p>
                                     </div>
-                                    <button type="button"
+                                    <button type="button" role="switch"
+                                            :aria-checked="modelSettings.expert_streaming_fast_resource_loading ? 'true' : 'false'"
                                             @click="modelSettings.expert_streaming_fast_resource_loading = !modelSettings.expert_streaming_fast_resource_loading"
                                             :class="modelSettings.expert_streaming_fast_resource_loading ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -897,7 +899,7 @@
                                         <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_direct_io') }}</span>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('modal.model_settings.expert_direct_io_hint') }}</p>
                                     </div>
-                                    <button type="button" @click="modelSettings.expert_streaming_direct_io = !modelSettings.expert_streaming_direct_io"
+                                    <button type="button" role="switch" :aria-checked="modelSettings.expert_streaming_direct_io ? 'true' : 'false'" @click="modelSettings.expert_streaming_direct_io = !modelSettings.expert_streaming_direct_io"
                                             :class="modelSettings.expert_streaming_direct_io ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.expert_streaming_direct_io ? 'translate-x-5' : 'translate-x-0'"
@@ -909,7 +911,7 @@
                                         <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_native_demand') }}</span>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('modal.model_settings.expert_native_demand_hint') }}</p>
                                     </div>
-                                    <button type="button" @click="modelSettings.expert_streaming_native_demand = !modelSettings.expert_streaming_native_demand"
+                                    <button type="button" role="switch" :aria-checked="modelSettings.expert_streaming_native_demand ? 'true' : 'false'" @click="modelSettings.expert_streaming_native_demand = !modelSettings.expert_streaming_native_demand"
                                             :class="modelSettings.expert_streaming_native_demand ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.expert_streaming_native_demand ? 'translate-x-5' : 'translate-x-0'"
@@ -921,7 +923,7 @@
                                         <span class="text-xs font-medium text-neutral-600">{{ t('modal.model_settings.expert_decode_scratch') }}</span>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('modal.model_settings.expert_decode_scratch_hint') }}</p>
                                     </div>
-                                    <button type="button" @click="modelSettings.expert_streaming_decode_scratch_as_cache = !modelSettings.expert_streaming_decode_scratch_as_cache"
+                                    <button type="button" role="switch" :aria-checked="modelSettings.expert_streaming_decode_scratch_as_cache ? 'true' : 'false'" @click="modelSettings.expert_streaming_decode_scratch_as_cache = !modelSettings.expert_streaming_decode_scratch_as_cache"
                                             :class="modelSettings.expert_streaming_decode_scratch_as_cache ? 'bg-black' : 'bg-neutral-200'"
                                             class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="modelSettings.expert_streaming_decode_scratch_as_cache ? 'translate-x-5' : 'translate-x-0'"
