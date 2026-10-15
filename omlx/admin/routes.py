@@ -67,6 +67,8 @@ from ..model_settings import (
     ModelSettings,
     ane_prefill_backend,
     ane_prefill_fraction,
+    EXPERT_STREAMING_DFLASH_ERROR,
+    resolve_expert_streaming_dflash_conflicts,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
     validate_ane_prefill,
@@ -2951,6 +2953,8 @@ async def update_model_settings(
     }
     if sent.intersection(expert_fields):
         candidate_data = current_settings.to_dict()
+        if "dflash_enabled" in sent:
+            candidate_data["dflash_enabled"] = bool(request.dflash_enabled)
         for field_name in sent.intersection(expert_fields):
             value = getattr(request, field_name)
             if field_name == "expert_streaming_manifest":
@@ -3311,6 +3315,10 @@ async def update_model_settings(
             )
             if not compat_ok:
                 raise HTTPException(status_code=400, detail=compat_reason)
+            if current_settings.expert_streaming_enabled:
+                raise HTTPException(
+                    status_code=400, detail=EXPERT_STREAMING_DFLASH_ERROR
+                )
         current_settings.dflash_enabled = new_dflash_enabled
     if "dflash_draft_model" in sent:
         current_settings.dflash_draft_model = request.dflash_draft_model or None
@@ -4181,6 +4189,8 @@ async def _apply_settings_snapshot(
     _note_conflict("vlm_mtp", conflicts, skipped)
     candidate, conflicts = resolve_qwen35_prefill_conflicts(candidate)
     _note_conflict("oq_a8", conflicts, skipped)
+    candidate, conflicts = resolve_expert_streaming_dflash_conflicts(candidate)
+    _note_conflict("dflash", conflicts, skipped)
     try:
         ModelSettings.from_dict(candidate)
         _validate_model_settings(entry, candidate)

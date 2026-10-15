@@ -11,6 +11,7 @@ from omlx.model_settings import (
     SETTINGS_VERSION,
     ModelSettings,
     ModelSettingsManager,
+    resolve_expert_streaming_dflash_conflicts,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
 )
@@ -961,3 +962,76 @@ def test_oq_a8_is_a_model_specific_profile_field():
     for name in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
         assert name in MODEL_SPECIFIC_PROFILE_FIELDS
         assert name not in UNIVERSAL_FIELDS_SET
+
+
+def test_expert_streaming_and_dflash_are_mutually_exclusive():
+    """Streaming and the DFlash drafter target both wrap the model class
+    __call__; streaming's teardown strips DFlash's wrapper but leaves its
+    markers, so a reload never reinstalls the hooks."""
+    with pytest.raises(ValueError, match="cannot be combined with DFlash"):
+        ModelSettings(
+            expert_streaming_enabled=True,
+            expert_streaming_mode="cache_only",
+            dflash_enabled=True,
+        )
+    # Either one alone is fine.
+    assert ModelSettings(dflash_enabled=True).dflash_enabled is True
+    assert ModelSettings(
+        expert_streaming_enabled=True, expert_streaming_mode="cache_only"
+    ).expert_streaming_enabled
+
+
+def test_expert_streaming_dflash_resolution_keeps_streaming():
+    data = {
+        "expert_streaming_enabled": True,
+        "expert_streaming_mode": "cache_only",
+        "dflash_enabled": True,
+        "max_tokens": 2048,
+    }
+    resolved, conflicts = resolve_expert_streaming_dflash_conflicts(data)
+    assert resolved["dflash_enabled"] is False
+    assert resolved["expert_streaming_enabled"] is True
+    assert resolved["max_tokens"] == 2048
+    assert conflicts == ["expert_streaming_enabled"]
+    assert ModelSettings.from_dict(resolved).dflash_enabled is False
+    clean = {"dflash_enabled": True}
+    assert resolve_expert_streaming_dflash_conflicts(clean) == (clean, [])
+
+
+def test_a_saved_streaming_plus_dflash_blob_still_loads(tmp_path):
+    path = tmp_path / "model_settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": SETTINGS_VERSION,
+                "models": {
+                    "stale/model": {
+                        "expert_streaming_enabled": True,
+                        "expert_streaming_mode": "cache_only",
+                        "dflash_enabled": True,
+                        "dflash_draft_model": "/tmp/draft",
+                        "qwen35_oq_a8_min_tokens": 512,
+                    }
+                },
+            }
+        )
+    )
+    settings = ModelSettingsManager(tmp_path).get_settings("stale/model")
+    assert settings.expert_streaming_enabled is True
+    assert settings.dflash_enabled is False
+    assert settings.qwen35_oq_a8_min_tokens == 512
+
+
+def test_dflash_draft_is_skipped_for_streaming_settings_that_bypass_validation():
+    from types import SimpleNamespace
+
+    from omlx.utils.model_loading import dflash_draft_for
+
+    stale = SimpleNamespace(
+        dflash_enabled=True,
+        dflash_draft_model="/tmp/draft",
+        expert_streaming_enabled=True,
+    )
+    assert dflash_draft_for(stale, None) is None
+    stale.expert_streaming_enabled = False
+    assert dflash_draft_for(stale, None) == "/tmp/draft"

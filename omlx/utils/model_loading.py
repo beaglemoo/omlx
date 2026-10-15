@@ -1382,6 +1382,10 @@ def dflash_draft_for(
     """The configured DFlash draft, else one bundled with the target."""
     if model_settings is None or not getattr(model_settings, "dflash_enabled", False):
         return None
+    # Streaming and the DFlash drafter target both wrap the model class call and
+    # cannot be unwound independently, so streaming wins (stale settings files).
+    if getattr(model_settings, "expert_streaming_enabled", False):
+        return None
     configured = getattr(model_settings, "dflash_draft_model", None)
     return configured or bundled_dflash_draft(model_path)
 

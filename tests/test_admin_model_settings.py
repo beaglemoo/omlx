@@ -947,3 +947,64 @@ async def test_enabling_dflash_over_a_deleted_draft_path_is_rejected(tmp_path):
             assert exc.value.status_code == 422
 
     manager.set_settings.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_enabling_dflash_on_a_streaming_model_is_rejected():
+    pool, _ = _failed_pool()
+    manager = MagicMock()
+    manager.get_settings.side_effect = lambda _: ModelSettings(
+        expert_streaming_enabled=True, expert_streaming_mode="cache_only"
+    )
+
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+        patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
+        patch.object(admin_routes, "dflash_compatibility", return_value=(True, "")),
+    ):
+        request = admin_routes.ModelSettingsRequest(dflash_enabled=True)
+        with pytest.raises(HTTPException) as exc:
+            await admin_routes.update_model_settings("ling", request, is_admin=True)
+    assert exc.value.status_code == 400
+    assert "DFlash" in exc.value.detail
+    manager.set_settings.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_enabling_streaming_on_a_dflash_model_is_rejected():
+    pool, _ = _failed_pool()
+    manager = MagicMock()
+    manager.get_settings.side_effect = lambda _: ModelSettings(dflash_enabled=True)
+
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+        patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
+    ):
+        request = admin_routes.ModelSettingsRequest(
+            expert_streaming_enabled=True, expert_streaming_mode="cache_only"
+        )
+        with pytest.raises(HTTPException) as exc:
+            await admin_routes.update_model_settings("ling", request, is_admin=True)
+    assert exc.value.status_code == 400
+    assert "DFlash" in exc.value.detail
+    manager.set_settings.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_swapping_dflash_for_streaming_in_one_request_is_accepted():
+    pool, _ = _failed_pool()
+    settings = ModelSettings(dflash_enabled=True)
+    with patch("omlx.expert_streaming.residency.estimate_for_model_settings"):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(
+                dflash_enabled=False,
+                expert_streaming_enabled=True,
+                expert_streaming_mode="cache_only",
+            ),
+        )
+    assert settings.dflash_enabled is False
+    assert settings.expert_streaming_enabled is True

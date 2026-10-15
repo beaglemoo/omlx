@@ -182,6 +182,29 @@ def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
     return resolved, ["qwen35_ane_prefill_enabled"]
 
 
+EXPERT_STREAMING_DFLASH_ERROR = (
+    "SSD expert streaming cannot be combined with DFlash; disable one of them. "
+    "Both wrap the model class call and unloading one removes the other's hooks."
+)
+
+
+def resolve_expert_streaming_dflash_conflicts(data: dict) -> tuple:
+    """Clear ``dflash_enabled`` when SSD expert streaming is also on.
+
+    Streaming wraps the model class ``__call__`` and DFlash's drafter target
+    wraps it again; streaming's teardown then strips DFlash's wrapper but
+    leaves its markers, so the next load never reinstalls the hooks. Streaming
+    wins because it is what lets the model fit in memory at all; dropping
+    DFlash only costs speed. Used for dicts that predate the exclusivity rule
+    so ``__post_init__`` does not reject the whole blob.
+    """
+    if not (data.get("expert_streaming_enabled") and data.get("dflash_enabled")):
+        return data, []
+    resolved = dict(data)
+    resolved["dflash_enabled"] = False
+    return resolved, ["expert_streaming_enabled"]
+
+
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
 
@@ -534,6 +557,8 @@ class ModelSettings:
                 "expert_streaming_io_coalescing_kib must be between 0 and 4096"
             )
         if self.expert_streaming_enabled:
+            if self.dflash_enabled:
+                raise ValueError(EXPERT_STREAMING_DFLASH_ERROR)
             if (
                 self.expert_streaming_mode == "soft_reap"
                 and not self.expert_streaming_manifest
@@ -822,6 +847,16 @@ class ModelSettingsManager:
                         "re-enable the oQ A8 prefill kernels.",
                         model_id,
                         ", ".join(prefill_conflicts),
+                    )
+                model_data, dflash_conflicts = (
+                    resolve_expert_streaming_dflash_conflicts(model_data)
+                )
+                if dflash_conflicts:
+                    logger.warning(
+                        "Model '%s': dflash_enabled disabled on load; it "
+                        "cannot be combined with SSD expert streaming. Turn "
+                        "streaming off to re-enable DFlash.",
+                        model_id,
                     )
                 try:
                     self._settings[model_id] = ModelSettings.from_dict(model_data)
@@ -1221,6 +1256,7 @@ class ModelSettingsManager:
         # request-time merge; drop vlm_mtp for the merged view instead.
         merged, _ = resolve_vlm_mtp_conflicts(merged)
         merged, _ = resolve_qwen35_prefill_conflicts(merged)
+        merged, _ = resolve_expert_streaming_dflash_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def _runtime_settings_with_profile_locked(
@@ -1231,6 +1267,7 @@ class ModelSettingsManager:
         merged.update(filter_profile_fields(profile.get("settings", {}) or {}))
         merged, _ = resolve_vlm_mtp_conflicts(merged)
         merged, _ = resolve_qwen35_prefill_conflicts(merged)
+        merged, _ = resolve_expert_streaming_dflash_conflicts(merged)
         return ModelSettings.from_dict(merged)
 
     def get_exposed_profile_source_model_id(self, model_id: str) -> Optional[str]:
@@ -1616,6 +1653,7 @@ class ModelSettingsManager:
         # VLM MTP toggle when the merged settings need logits processors.
         merged, _ = resolve_vlm_mtp_conflicts(merged)
         merged, _ = resolve_qwen35_prefill_conflicts(merged)
+        merged, _ = resolve_expert_streaming_dflash_conflicts(merged)
         new_settings = ModelSettings.from_dict(merged)
         return new_settings
 

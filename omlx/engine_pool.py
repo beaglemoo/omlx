@@ -1424,7 +1424,11 @@ class EnginePool:
             add("specprefill_keep_pct", data.get("specprefill_keep_pct", 0.2))
             add("specprefill_threshold", data.get("specprefill_threshold"))
 
-        dflash_enabled = bool(data.get("dflash_enabled", False)) and not is_diffusion
+        dflash_enabled = (
+            bool(data.get("dflash_enabled", False))
+            and not is_diffusion
+            and not data.get("expert_streaming_enabled", False)
+        )
         dflash_draft = data.get("dflash_draft_model")
         if dflash_enabled and not dflash_draft and entry is not None:
             dflash_draft = bundled_dflash_draft(entry.model_path)
@@ -4037,6 +4041,14 @@ class EnginePool:
                     logger.warning(
                         "DFlash is not supported for diffusion models; "
                         "loading %s with its native VLM engine",
+                        model_id,
+                    )
+                elif dflash_enabled and getattr(
+                    model_settings, "expert_streaming_enabled", False
+                ):
+                    logger.warning(
+                        "DFlash cannot run with SSD expert streaming; "
+                        "loading %s without DFlash",
                         model_id,
                     )
                 elif dflash_enabled and not dflash_draft:
