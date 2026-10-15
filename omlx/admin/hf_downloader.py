@@ -1203,7 +1203,8 @@ class HFDownloader(_QueuePersistenceMixin):
             ValueError: If repo_id format is invalid or download is already queued.
         """
         repo_id = repo_id.strip()
-        if "/" not in repo_id or len(repo_id.split("/")) != 2:
+        parts = repo_id.split("/")
+        if len(parts) != 2 or any(part in ("", ".", "..") for part in parts):
             raise ValueError(
                 f"Invalid repository ID: '{repo_id}'. "
                 "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"
@@ -1599,13 +1600,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 logger.error(
                     f"Failed to clean up cancelled download {task.repo_id}: {e}"
                 )
-        except RepositoryNotFoundError:
-            task.status = DownloadStatus.FAILED
-            task.error = (
-                f"Repository not found: {task.repo_id}. "
-                "This may be a gated model that requires HuggingFace authentication."
-            )
-            logger.error(f"Repository not found: {task.repo_id}")
+        # GatedRepoError subclasses RepositoryNotFoundError.
         except GatedRepoError:
             task.status = DownloadStatus.FAILED
             task.error = (
@@ -1613,6 +1608,13 @@ class HFDownloader(_QueuePersistenceMixin):
                 "Please provide a valid HF token with access."
             )
             logger.error(f"Gated repo access denied: {task.repo_id}")
+        except RepositoryNotFoundError:
+            task.status = DownloadStatus.FAILED
+            task.error = (
+                f"Repository not found: {task.repo_id}. "
+                "This may be a gated model that requires HuggingFace authentication."
+            )
+            logger.error(f"Repository not found: {task.repo_id}")
         except Exception as e:
             # Do not clobber an earlier terminal error or a user cancellation.
             if (
