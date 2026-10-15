@@ -1,0 +1,4 @@
+# The native extensions are custom setuptools Extension classes (CMake or
+# Metal), so setuptools does not add their build sources to the sdist on its
+# own. Without these a native wheel built from the sdist cannot find them.
+recursive-include omlx/custom_kernels/*/csrc *.txt *.mm *.h *.hpp *.cpp *.metal
