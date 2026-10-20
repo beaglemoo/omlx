@@ -21,8 +21,24 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
         echo "Creating isolated Python 3.11 kernel build environment..."
         uv venv --python 3.11 "$BUILD_ENV"
     fi
+    # setuptools, cmake and nanobind come from pyproject.toml [build-system]:
+    # the kernels must be built with the nanobind that MLX itself pins.
+    BUILD_REQS=()
+    while IFS= read -r req; do
+        BUILD_REQS+=("$req")
+    done < <("$BUILD_ENV/bin/python" - "$REPO_ROOT/pyproject.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    reqs = tomllib.load(f)["build-system"]["requires"]
+for r in reqs:
+    if r.startswith(("setuptools", "cmake", "nanobind")):
+        print(r)
+PY
+)
     uv pip install --quiet --python "$BUILD_ENV/bin/python" \
-        "pip>=24" "cmake>=3.27" "nanobind==2.13.0" "setuptools>=61" wheel
+        "pip>=24" wheel "${BUILD_REQS[@]}"
     PYTHON_BIN="$BUILD_ENV/bin/python"
 fi
 
