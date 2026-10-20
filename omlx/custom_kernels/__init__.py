@@ -6,12 +6,11 @@ from __future__ import annotations
 import importlib
 
 NATIVE_KERNEL_PACKAGES = (
-    "bonsai",
-    "decode_fast",
+    "attention",
     "fast_resource_loading",
-    "glm_moe_dsa",
-    "minimax_m3",
-    "qwen35_prefill",
+    "lowbit",
+    "quant_matmul",
+    "sparse_index",
 )
 
 

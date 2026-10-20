@@ -2,3 +2,5 @@
 # Metal), so setuptools does not add their build sources to the sdist on its
 # own. Without these a native wheel built from the sdist cannot find them.
 recursive-include omlx/custom_kernels/*/csrc *.txt *.mm *.h *.hpp *.cpp *.metal
+# Shared headers used by several kernel packages (setup.py include_dirs).
+recursive-include omlx/custom_kernels/include *.h *.hpp

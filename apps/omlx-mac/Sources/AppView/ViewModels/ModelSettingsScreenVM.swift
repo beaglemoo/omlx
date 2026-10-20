@@ -48,7 +48,7 @@ final class ModelSettingsScreenVM {
         case embeddingAudioEnabled, embeddingAudioMaxSeconds
         case reasoningParser
         case chatTemplateKwargs
-        case turboquantKvEnabled, turboquantKvBits
+        case turboquantKvEnabled, turboquantKvScheme, turboquantKvBits
         case qwen35AnePrefillSharedFraction
         case qwen35OqA8Enabled, qwen35OqA8MinTokens
         case qwen35AnePrefillEnabled, qwen35AnePrefillSequenceLength
@@ -98,6 +98,14 @@ final class ModelSettingsScreenVM {
             ("decision", String(localized: "settings.model_type.decision",
                                 defaultValue: "Decision",
                                 comment: "Model type option label for decision models served by /v1/systemone")),
+        ]
+    }
+
+    static var turboquantKvSchemeOptions: [(String, String)] {
+        [
+            ("turboquant", "TurboQuant"),
+            ("affine4", "Affine4 · 4-bit"),
+            ("affine8", "Affine8 · 8-bit"),
         ]
     }
 
@@ -310,6 +318,14 @@ final class ModelSettingsScreenVM {
     /// External engine serving the model; empty runs it in-process.
     var externalEngine: String = ""
 
+    /// The engine that serves the model: the setting, or for a GGUF, which
+    /// only an external engine runs, the first engine that can serve it.
+    var effectiveExternalEngine: String {
+        guard externalEngine.isEmpty, model?.isGGUF == true else { return externalEngine }
+        let engines = model?.externalEngines ?? []
+        return engines.first(where: { $0.compatible })?.id ?? engines.first?.id ?? ""
+    }
+
     // Embedding audio tower. Empty seconds keeps the 30 s processor default.
     var embeddingAudioEnabled: Bool = false
     var embeddingAudioMaxSeconds: String = ""
@@ -333,6 +349,7 @@ final class ModelSettingsScreenVM {
 
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool = false
+    var turboquantKvScheme: String = "turboquant"
     var turboquantKvBits: String = "4"
 
     // Experimental: oQ mixed-bit INT8-activation prefill kernels. There is no
@@ -493,6 +510,9 @@ final class ModelSettingsScreenVM {
 
     var showsGenerationSection: Bool { isLLMLike }
 
+    /// Embedding requests without max_length truncate input to the context window.
+    var showsEmbeddingContextWindow: Bool { model?.modelType == "embedding" }
+
     /// Acceleration, Memory Saving and Experimental only apply to the MLX
     /// LLM engines.
     var showsEnginePages: Bool { isLLMLike && !isDiffusionModel }
@@ -578,7 +598,7 @@ final class ModelSettingsScreenVM {
             return true
         case .forceSampling, .reasoningParser:
             return true
-        case .turboquantKvEnabled, .turboquantKvBits:
+        case .turboquantKvEnabled, .turboquantKvScheme, .turboquantKvBits:
             return true
         case .qwen35AnePrefillSharedFraction,
              .qwen35OqA8Enabled, .qwen35OqA8MinTokens:
@@ -787,6 +807,7 @@ final class ModelSettingsScreenVM {
                     )
                 )
                 self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
+                self.turboquantKvScheme = s?.turboquantKvScheme ?? "turboquant"
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
                 self.qwen35AnePrefillSharedFraction = s?.qwen35AnePrefillSharedFraction.map { String($0) } ?? "1"
                 self.qwen35OqA8Enabled = s?.qwen35OqA8Enabled ?? false
@@ -958,6 +979,15 @@ final class ModelSettingsScreenVM {
             patch.chatTemplateKwargs = pair.kwargs ?? [:]
             patch.forcedCtKwargs = pair.forced ?? []
         case .turboquantKvEnabled:     patch.turboquantKvEnabled = turboquantKvEnabled
+        case .turboquantKvScheme:
+            patch.turboquantKvScheme = turboquantKvScheme
+            if turboquantKvScheme == "affine4" {
+                turboquantKvBits = "4"
+                patch.turboquantKvBits = 4
+            } else if turboquantKvScheme == "affine8" {
+                turboquantKvBits = "8"
+                patch.turboquantKvBits = 8
+            }
         case .turboquantKvBits:        patch.turboquantKvBits = Double(turboquantKvBits)
         case .qwen35AnePrefillSharedFraction:
             guard validateAneWorkingSettings() else { return }
@@ -1538,7 +1568,7 @@ final class ModelSettingsScreenVM {
             }
             return profileDisplayName(scope: activeProfileScope, name: name)
         case .acceleration, .memory, .experimental:
-            if !externalEngine.isEmpty { return Self.summaryExternalEngine }
+            if !effectiveExternalEngine.isEmpty { return Self.summaryExternalEngine }
             return Self.summary(enabledFeatures(on: page), empty: Self.summaryOff)
         case .advanced:
             return Self.summary(enabledFeatures(on: .advanced), empty: Self.summaryOff)
@@ -1600,9 +1630,10 @@ final class ModelSettingsScreenVM {
                                     comment: "TurboQuant KV in the Memory Saving row value; placeholder is the bit width"))
             }
         case .advanced:
-            if !isDiffusionModel, !externalEngine.isEmpty {
-                let label = model?.externalEngines?.first(where: { $0.id == externalEngine })?.label
-                items.append(label ?? externalEngine)
+            if !isDiffusionModel, !effectiveExternalEngine.isEmpty {
+                let engine = effectiveExternalEngine
+                let label = model?.externalEngines?.first(where: { $0.id == engine })?.label
+                items.append(label ?? engine)
             }
             if trustRemoteCode {
                 items.append(String(localized: "settings.advanced.trust_remote_code.label",
@@ -1798,8 +1829,13 @@ final class ModelSettingsScreenVM {
                 }
             }
             putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
-            if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
-                out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
+            if turboquantKvEnabled {
+                putString(ProfileSettingsKey.turboquantKvScheme, turboquantKvScheme)
+                let fixedBits = turboquantKvScheme == "affine4"
+                    ? 4.0 : turboquantKvScheme == "affine8" ? 8.0 : nil
+                if let bits = fixedBits ?? Double(turboquantKvBits) {
+                    out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
+                }
             }
             putBool(ProfileSettingsKey.qwen35OqA8Enabled, qwen35OqA8Enabled)
             if qwen35OqA8Enabled {
