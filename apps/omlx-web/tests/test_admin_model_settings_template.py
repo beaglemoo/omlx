@@ -264,7 +264,7 @@ def test_expert_streaming_cold_execution_bank_is_fully_wired():
     assert f'modelSettings.{field}' in html
     assert script.count(f"{field}:") >= 2
     assert f"s.{field} ?? 32" in script
-    assert f"Number(this.modelSettings.{field}) || 0" in script
+    assert f"Number(ms.{field}) || 0" in script
 
 
 def test_expert_streaming_fast_resource_loading_is_fully_wired():
@@ -275,7 +275,7 @@ def test_expert_streaming_fast_resource_loading_is_fully_wired():
     assert f"modelSettings.{field}" in html
     assert script.count(f"{field}:") >= 2
     assert f"s.{field} !== false" in script
-    assert f"!!this.modelSettings.{field}" in script
+    assert f"!!ms.{field}" in script
 
 
 def test_expert_streaming_acceleration_controls_are_fully_wired():
