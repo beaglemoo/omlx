@@ -3209,7 +3209,7 @@
                         ms.expert_streaming_mode || 'soft_reap',
                     expert_streaming_manifest:
                         ms.expert_streaming_enabled
-                        && (ms.expert_streaming_mode || 'soft_reap') === 'soft_reap'
+                        && ms.expert_streaming_mode === 'soft_reap'
                             ? (ms.expert_streaming_manifest || null)
                             : null,
                     expert_streaming_cache_experts:
@@ -3218,9 +3218,11 @@
                         Number(ms.expert_streaming_scratch_experts) || 0,
                     expert_streaming_cache_policy:
                         ms.expert_streaming_cache_policy || 'route_frequency',
+                    // Independent of the enable flag: direct I/O and native demand
+                    // require it, and the unchanged-field filter would otherwise let a
+                    // value saved while streaming was off block the next enable.
                     expert_streaming_fast_resource_loading:
-                        !!ms.expert_streaming_enabled
-                        && !!ms.expert_streaming_fast_resource_loading,
+                        !!ms.expert_streaming_fast_resource_loading,
                     expert_streaming_direct_io:
                         !!ms.expert_streaming_direct_io,
                     expert_streaming_native_demand:
@@ -3441,10 +3443,24 @@
                         const initial = this.buildModelSettingsPayload(
                             JSON.parse(this._modelSettingsBaseline),
                         );
+                        const full = {...payload};
                         for (const key of Object.keys(payload)) {
                             if (key !== 'mtp_fixed_depth'
                                 && JSON.stringify(payload[key]) === JSON.stringify(initial[key])) {
                                 delete payload[key];
+                            }
+                        }
+                        // The server validates these together with the enable flag, so a
+                        // change to it always carries the whole group.
+                        if ('expert_streaming_enabled' in payload) {
+                            for (const key of [
+                                'expert_streaming_mode',
+                                'expert_streaming_manifest',
+                                'expert_streaming_fast_resource_loading',
+                                'expert_streaming_direct_io',
+                                'expert_streaming_native_demand',
+                            ]) {
+                                payload[key] = full[key];
                             }
                         }
                     }

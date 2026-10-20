@@ -781,6 +781,51 @@ test('Template matching ignores nested dictionary ordering', () => {
     copy.settings.chat_template_kwargs.custom = 2;
     assert.equal(state.matchingProfileTemplate(copy), null);
 });
+
+test('Expert streaming: disable, save, reopen, enable, save is accepted', async () => {
+    // Stand-in for the server: merge the PUT onto the stored settings and apply
+    // ModelSettings' streaming validation.
+    const stored = {
+        expert_streaming_enabled: true, expert_streaming_mode: 'cache_only',
+        expert_streaming_fast_resource_loading: true, expert_streaming_direct_io: true,
+        expert_streaming_native_demand: true,
+    };
+    const bodies = [];
+    const state = setup(async (url, options) => {
+        const body = JSON.parse(options.body);
+        bodies.push(body);
+        const merged = {...stored, ...body};
+        if (merged.expert_streaming_enabled
+            && !merged.expert_streaming_fast_resource_loading
+            && (merged.expert_streaming_direct_io || merged.expert_streaming_native_demand)) {
+            return {ok: false, status: 400, json: async () => ({detail: 'require Fast Resource Loading'})};
+        }
+        Object.assign(stored, merged);
+        return {ok: true, json: async () => ({})};
+    });
+    state.loadModels = async () => {};
+    state.alert = () => {};
+    const open = () => {
+        state.modelSettings = state.buildModelSettingsState(state.selectedModel, stored);
+        state._modelSettingsBaseline = JSON.stringify(state.modelSettings);
+    };
+    open();
+    state.modelSettings.expert_streaming_enabled = false;
+    await state.saveModelSettings();
+    assert.equal(stored.expert_streaming_enabled, false);
+    assert.equal(stored.expert_streaming_fast_resource_loading, true);
+    open();
+    state.modelSettings.expert_streaming_enabled = true;
+    await state.saveModelSettings();
+    assert.equal(stored.expert_streaming_enabled, true);
+    assert.equal(stored.expert_streaming_fast_resource_loading, true);
+    // The enable change carries the interdependent group even when unchanged.
+    const last = bodies[bodies.length - 1];
+    for (const key of ['expert_streaming_mode', 'expert_streaming_fast_resource_loading',
+                       'expert_streaming_direct_io', 'expert_streaming_native_demand']) {
+        assert.ok(key in last, key);
+    }
+});
 """
     result = subprocess.run(
         [node, "-e", script],
