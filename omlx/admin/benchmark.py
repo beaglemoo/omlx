@@ -930,6 +930,7 @@ async def _run_single_test(
             max_tokens=max_tokens,
             temperature=0.0,
             top_p=1.0,
+            ignore_eos=True,
             skip_cache_store=True,
             benchmark_trace=True,
             benchmark_ane_sequence_length=int(
@@ -1271,6 +1272,7 @@ async def _run_batch_test(
         max_tokens=max_tokens,
         temperature=0.0,
         top_p=1.0,
+        ignore_eos=True,
     )
     streaming_before = _expert_streaming_snapshot(engine)
     active_memory_start = _active_metal_memory()

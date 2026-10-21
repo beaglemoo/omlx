@@ -953,14 +953,17 @@ def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
     return False, ""
 
 
+# ParoQuant targets whose rotated layers are checked on the DFlash verify path.
+_PAROQUANT_DFLASH_MODEL_TYPES = {"qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"}
+
+
 def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     """Resolve dflash compatibility for an engine_pool model dict."""
+    model_type = model_info.get("config_model_type")
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
-    if is_paro:
+    if is_paro and model_type not in _PAROQUANT_DFLASH_MODEL_TYPES:
         return False, paro_reason
-    return dflash_compatibility(
-        model_info.get("config_model_type"), model_info.get("engine_type")
-    )
+    return dflash_compatibility(model_type, model_info.get("engine_type"))
 
 
 def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list[dict]:
@@ -3382,8 +3385,12 @@ async def update_model_settings(
             False if is_diffusion_model else bool(request.dflash_enabled)
         )
         if new_dflash_enabled:
-            compat_ok, compat_reason = dflash_compatibility(
-                entry.config_model_type, entry.engine_type
+            compat_ok, compat_reason = _dflash_compat_for_model(
+                {
+                    "model_path": entry.model_path,
+                    "config_model_type": entry.config_model_type,
+                    "engine_type": entry.engine_type,
+                }
             )
             if not compat_ok:
                 raise HTTPException(status_code=400, detail=compat_reason)
@@ -8365,8 +8372,10 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             continue
         seen_names.add(info["id"])
         source = Path(info.get("source_path") or "")
-        parts = (gguf.source_info(info["model_path"]) or {}).get("parts") or []
-        registered.update(source.parent / name for name in parts)
+        gguf_info = gguf.source_info(info["model_path"]) or {}
+        folder = Path(gguf_info.get("directory") or source.parent)
+        parts = gguf_info.get("source_parts") or []
+        registered.update((folder / name).resolve() for name in parts)
         models.append(
             {
                 "name": info["id"],
@@ -8392,7 +8401,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
         stranded = [
             path
             for path in folder.rglob("*.gguf")
-            if path not in registered
+            if path.resolve() not in registered
             and not (path.parent == folder and gguf.file_kind(path.name) != "gguf")
         ]
         if stranded and name not in seen_names:
@@ -8574,13 +8583,13 @@ async def _delete_gguf_model(entry, model_dirs: list[Path], engine_pool) -> None
     Vision projectors stay while another GGUF in the folder pairs with them.
     """
     info = gguf.source_info(entry.model_path) or {}
-    folder = Path(entry.source_path).parent
+    folder = Path(info.get("directory") or Path(entry.source_path).parent)
     if not any(
         folder.resolve().is_relative_to(model_dir.resolve())
         for model_dir in model_dirs
     ):
         raise HTTPException(status_code=400, detail="Invalid model name")
-    names = info.get("parts") or [Path(entry.source_path).name]
+    names = info.get("source_parts") or [Path(entry.source_path).name]
     parts = [folder / name for name in names]
 
     hf_cache = entry.source_type == "hf_cache"
@@ -8595,7 +8604,12 @@ async def _delete_gguf_model(entry, model_dirs: list[Path], engine_pool) -> None
         # The folder goes with its last GGUF, and with it every download
         # into it; otherwise only a download of these files stops.
         await _hf_downloader.cancel_download_for_dir(
-            folder, [part.name for part in parts] if remaining else None
+            folder,
+            (
+                [part.relative_to(folder).as_posix() for part in parts]
+                if remaining
+                else None
+            ),
         )
     if entry.model_id in engine_pool.get_loaded_model_ids():
         try:
@@ -8620,7 +8634,11 @@ async def _delete_gguf_model(entry, model_dirs: list[Path], engine_pool) -> None
                 is_model_dir = any(
                     folder.resolve() == model_dir.resolve() for model_dir in model_dirs
                 )
-                if not is_model_dir and not any(folder.rglob("*.gguf")):
+                if (
+                    not is_model_dir
+                    and not gguf.holds_checkpoint(folder)
+                    and not any(folder.rglob("*.gguf"))
+                ):
                     shutil.rmtree(folder)
                     parent = folder.parent
                     if (
